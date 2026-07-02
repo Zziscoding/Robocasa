@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "seed": 0,
+  "finger_points_per_finger": 20,
+  "edge_margin": 1e-05,
+  "ee_site_name": "gripper0_right_grip_site",
+  "object_body_id": 155,
+  "object_part_count": 1,
+  "feasible_point_count": 20,
+  "edge_count": 40,
+  "modes": {
+    "gripper_open": {
+      "finger_point_count": 40,
+      "finger_part_count": 2,
+      "finger_joint_qpos": [
+        0.04,
+        -0.04
+      ]
+    },
+    "gripper_closed": {
+      "finger_point_count": 40,
+      "finger_part_count": 1,
+      "finger_joint_qpos": [
+        0.0,
+        0.0
+      ]
+    }
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "cache_version": 2,
+  "points_per_link": 64,
+  "body_prefix": null,
+  "body_names": [],
+  "seed": 0,
+  "coacd": {
+    "threshold": 0.05,
+    "max_convex_hull": 32,
+    "preprocess_mode": "auto",
+    "preprocess_resolution": 30,
+    "resolution": 2000,
+    "mcts_nodes": 20,
+    "mcts_iterations": 100,
+    "mcts_max_depth": 3,
+    "max_ch_vertex": 256
+  },
+  "source_sha256": "7fb1e13cb94f2ed4b62e832c43267e380c15ccae31066fe6eaa41ea3da22fe65",
+  "links": [
+    {
+      "name": "stack_4_main_group_2_main",
+      "source_body_id": 2,
+      "geom_names": [
+        "stack_4_main_group_2_top_visual",
+        "stack_4_main_group_2_bottom_visual",
+        "stack_4_main_group_2_back_visual",
+        "stack_4_main_group_2_right_visual",
+        "stack_4_main_group_2_left_visual"
+      ],
+      "arrays": "0002_stack_4_main_group_2_main.npz",
+      "tree": "0002_stack_4_main_group_2_main.kdtree.pkl",
+      "hull_count": 17
+    },
+    {
+      "name": "stack_4_main_group_2_inner_box",
+      "source_body_id": 3,
+      "geom_names": [
+        "stack_4_main_group_2_inner_bottom_visual",
+        "stack_4_main_group_2_inner_back_visual",
+        "stack_4_main_group_2_inner_right_visual",
+        "stack_4_main_group_2_inner_left_visual"
+      ],
+      "arrays": "0003_stack_4_main_group_2_inner_box.npz",
+      "tree": "0003_stack_4_main_group_2_inner_box.kdtree.pkl",
+      "hull_count": 9
+    },
+    {
+      "name": "stack_4_main_group_2_door_main",
+      "source_body_id": 4,
+      "geom_names": [
+        "stack_4_main_group_2_door_g0"
+      ],
+      "arrays": "0004_stack_4_main_group_2_door_main.npz",
+      "tree": "0004_stack_4_main_group_2_door_main.kdtree.pkl",
+      "hull_count": 6
+    },
+    {
+      "name": "stack_4_main_group_2_door_handle_main",
+      "source_body_id": 5,
+      "geom_names": [
+        "stack_4_main_group_2_door_handle_g0"
+      ],
+      "arrays": "0005_stack_4_main_group_2_door_handle_main.npz",
+      "tree": "0005_stack_4_main_group_2_door_handle_main.kdtree.pkl",
+      "hull_count": 3
+    }
+  ]
+}

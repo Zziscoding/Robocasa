@@ -1,0 +1,65 @@
+<mujoco model="drawer">
+  <compiler angle="radian" />
+  <asset>
+    <texture file="/home/lab423/wm/vlm/robocasa/robocasa/models/assets/textures/flat/gray.png" type="cube" name="flat/gray" />
+    <material name="stack_4_main_group_2_mat" shininess="0.1" texture="flat/gray" />
+  <mesh file="/home/lab423/wm/vlm/robocasa/robocasa/models/assets/fixtures/cabinets/cabinet_panels/CabinetDoorPanel047/visuals/CabinetDoorPanel047.obj" name="stack_4_main_group_2_door_CabinetDoorPanel047_vis" scale="1.7833567000247057 1.059007917445114 0.3472203854485292" />
+    <texture file="/home/lab423/wm/vlm/robocasa/robocasa/models/assets/textures/flat/gray.png" name="flat/gray_2d" type="2d" />
+    <material name="stack_4_main_group_2_door_mat" rgba="1 1 1 1.0" texture="flat/gray_2d" shininess="0.5" specular="0.3103448502657381" />
+  <mesh file="/home/lab423/wm/vlm/robocasa/robocasa/models/assets/fixtures/handles/CabinetHandle003/visuals/CabinetHandle003.obj" name="stack_4_main_group_2_door_handle_CabinetHandle003_vis" scale="1.0 1.0 0.4594092281400349" />
+    <texture file="/home/lab423/wm/vlm/robocasa/robocasa/models/assets/textures/metals/bright_metal.png" name="VisualMeshElongatedHandle_metals/bright_metal" type="2d" />
+    <material name="stack_4_main_group_2_door_handle_mat" rgba="1 1 1 1.0" texture="VisualMeshElongatedHandle_metals/bright_metal" shininess="0.5" specular="0.3103448502657381" />
+  </asset>
+  <worldbody>
+    <body>
+      <body name="stack_4_main_group_2_main" pos="3.8646626494078515 -0.3 0.7849999999999999">
+        <geom pos="0 0.015 0.09" size="0.35 0.285 0.015" type="box" mass=".2" name="stack_4_main_group_2_top" group="0" density="10" rgba="0.5 0 0 1" />
+        <geom pos="0 0.015 -0.09" size="0.35 0.285 0.015" type="box" mass=".2" name="stack_4_main_group_2_bottom" group="0" density="10" rgba="0.5 0 0 1" />
+        <geom pos="0 0.285 0" size="0.31999999999999995 0.015 0.075" type="box" mass=".2" name="stack_4_main_group_2_back" group="0" density="10" rgba="0.5 0 0 1" />
+        <geom pos="0.33499999999999996 0.015 0" size="0.015 0.285 0.075" type="box" mass=".2" name="stack_4_main_group_2_right" group="0" density="10" rgba="0.5 0 0 1" />
+        <geom pos="-0.33499999999999996 0.015 0" size="0.015 0.285 0.075" type="box" mass=".2" name="stack_4_main_group_2_left" group="0" density="10" rgba="0.5 0 0 1" />
+        <body name="stack_4_main_group_2_inner_box" pos="0 0 0">
+          <joint axis="0 1 0" type="slide" name="stack_4_main_group_2_slidejoint" limited="true" range="-0.6 0" damping="10" pos="0 -0.3 0" />
+          <geom pos="0 0 -0.059" size="0.31899999999999995 0.27 0.015" type="box" mass=".2" name="stack_4_main_group_2_inner_bottom" group="0" density="10" rgba="0.5 0 0 1" />
+          <geom pos="0 0.255 0" size="0.2889999999999999 0.015 0.044" type="box" mass=".2" name="stack_4_main_group_2_inner_back" group="0" density="10" rgba="0.5 0 0 1" />
+          <geom pos="0.30399999999999994 0 0" size="0.015 0.27 0.044" type="box" mass=".2" name="stack_4_main_group_2_inner_right" group="0" density="10" rgba="0.5 0 0 1" />
+          <geom pos="-0.30399999999999994 0 0" size="0.015 0.27 0.044" type="box" mass=".2" name="stack_4_main_group_2_inner_left" group="0" density="10" rgba="0.5 0 0 1" />
+          
+          <geom name="stack_4_main_group_2_reg_int" type="box" pos="0.0 -0.015 0.015" size="0.2889999999999999 0.255 0.059" group="1" conaffinity="0" contype="0" rgba="0.0 1.0 0.0 0.0" />
+          <site rgba="0.5 0.5 0.5 0" size="0.005" pos="-1e-05 -1e-05 -1e-05" name="stack_4_main_group_2_int_p0" />
+          <site rgba="1 1 0 0" size="0.005" pos="1e-05 -1e-05 -1e-05" name="stack_4_main_group_2_int_px" />
+          <site rgba="0 1 1 0" size="0.005" pos="-1e-05 1e-05 -1e-05" name="stack_4_main_group_2_int_py" />
+          <site rgba="1 0 1 0" size="0.005" pos="-1e-05 -1e-05 1e-05" name="stack_4_main_group_2_int_pz" />
+        <geom pos="0 0 -0.059" size="0.31899999999999995 0.27 0.015" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_inner_bottom_visual" group="1" density="10" conaffinity="0" contype="0" />
+          <geom pos="0 0.255 0" size="0.2889999999999999 0.015 0.044" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_inner_back_visual" group="1" density="10" conaffinity="0" contype="0" />
+          <geom pos="0.30399999999999994 0 0" size="0.015 0.27 0.044" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_inner_right_visual" group="1" density="10" conaffinity="0" contype="0" />
+          <geom pos="-0.30399999999999994 0 0" size="0.015 0.27 0.044" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_inner_left_visual" group="1" density="10" conaffinity="0" contype="0" />
+          
+          <body name="stack_4_main_group_2_door_main" pos="0.0 -0.2850000887650182 5.1739869333584484e-09">
+        <geom mesh="stack_4_main_group_2_door_CabinetDoorPanel047_vis" type="mesh" solimp="0.9 0.95 0.001 0.5 2" solref="0.02 1" friction="1 0.005 0.0001" material="stack_4_main_group_2_door_mat" conaffinity="0" contype="0" group="1" name="stack_4_main_group_2_door_g0" density="0" />
+        <geom type="box" pos="0.0 8.876501821918436e-08 -5.1739869333584484e-09" size="0.3485 0.015 0.1035" quat="1.0 0.0 0.0 0.0" group="0" rgba="0.5 0 0 0.5" density="10" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2" name="stack_4_main_group_2_door_g1" friction="1 0.005 0.0001" />
+        <geom name="stack_4_main_group_2_door_reg_main" type="box" pos="0.0 8.876501821918436e-08 -5.1739869333584484e-09" size="0.3485 0.015 0.1035" group="1" conaffinity="0" contype="0" rgba="0 1 0 0" mass="0" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2" density="0" friction="1 0.005 0.0001" />
+      <site pos="0.0 0.0 0.0" size="0.0035667134000494116 0.0021180158348902277 0.0006944407708970584" rgba="1 0 0 0" type="sphere" group="0" name="stack_4_main_group_2_door_default_site" /><body name="stack_4_main_group_2_door_handle_main" euler="0.0 1.5708 0.0" pos="0.0 -0.03637041087568498 0.0">
+        <geom mesh="stack_4_main_group_2_door_handle_CabinetHandle003_vis" type="mesh" solimp="0.9 0.95 0.001 0.5 2" solref="0.02 1" friction="1 0.005 0.0001" material="stack_4_main_group_2_door_handle_mat" conaffinity="0" contype="0" group="1" name="stack_4_main_group_2_door_handle_g0" density="0" />
+        <geom type="box" pos="0.0 -0.01527157612144947 0.0" size="0.011696524918079376 0.0077113197185099125 0.06318815734848666" quat="1.0 0.0 0.0 0.0" group="0" rgba="0.5 0 0 0.5" density="10" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2" name="stack_4_main_group_2_door_handle_g1" friction="1 0.005 0.0001" />
+        <geom type="box" pos="-2.3449556242447345e-17 0.00762567576020956 0.04906415818130875" size="0.011696526780724525 0.015480552799999714 0.0036177326359396814" quat="1.0 0.0 0.0 0.0" group="0" rgba="0.5 0 0 0.5" density="10" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2" name="stack_4_main_group_2_door_handle_g2" friction="1 0.005 0.0001" />
+        <geom type="box" pos="-2.3449556242447345e-17 0.00762567576020956 -0.04901496475861254" size="0.011696524918079376 0.015480552799999714 0.0036177326359396814" quat="1.0 0.0 0.0 0.0" group="0" rgba="0.5 0 0 0.5" density="10" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2" name="stack_4_main_group_2_door_handle_g3" friction="1 0.005 0.0001" />
+        <geom name="stack_4_main_group_2_door_handle_reg_main" type="box" pos="0.0 0.0 0.0" size="0.012435028165578843 0.023870499640703202 0.0635" group="1" conaffinity="0" contype="0" rgba="0 1 0 0" mass="0" solref="0.02 1" solimp="0.9 0.95 0.001 0.5 2" density="0" friction="1 0.005 0.0001" />
+      <site pos="0.0 0.0 0.0" size="0.002 0.002 0.0009188184562800698" rgba="1 0 0 0" type="sphere" group="0" name="stack_4_main_group_2_door_handle_default_site" /></body>
+    </body>
+    </body>
+        
+        <geom name="stack_4_main_group_2_reg_main" type="box" pos="0.0 0.0 0.0" size="0.35 0.3 0.105" group="1" conaffinity="0" contype="0" rgba="0.0 1.0 0.0 0.0" />
+        <site rgba="0 0 0 0" size="0.005" pos="0.0 0.0 0.0" name="stack_4_main_group_2_ext_p0" />
+        <site rgba="1 0 0 0" size="0.005" pos="0.0 0.0 0.0" name="stack_4_main_group_2_ext_px" />
+        <site rgba="0 1 0 0" size="0.005" pos="0.0 0.0 0.0" name="stack_4_main_group_2_ext_py" />
+        <site rgba="0 0 1 0" size="0.005" pos="0.0 0.0 0.0" name="stack_4_main_group_2_ext_pz" />
+      <geom pos="0 0.015 0.09" size="0.35 0.285 0.015" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_top_visual" group="1" density="10" conaffinity="0" contype="0" />
+        <geom pos="0 0.015 -0.09" size="0.35 0.285 0.015" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_bottom_visual" group="1" density="10" conaffinity="0" contype="0" />
+        <geom pos="0 0.285 0" size="0.31999999999999995 0.015 0.075" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_back_visual" group="1" density="10" conaffinity="0" contype="0" />
+        <geom pos="0.33499999999999996 0.015 0" size="0.015 0.285 0.075" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_right_visual" group="1" density="10" conaffinity="0" contype="0" />
+        <geom pos="-0.33499999999999996 0.015 0" size="0.015 0.285 0.075" type="box" mass="1e-8" material="stack_4_main_group_2_mat" name="stack_4_main_group_2_left_visual" group="1" density="10" conaffinity="0" contype="0" />
+        <site pos="0.0 0.0 0.0" size="0.002 0.002 0.002" rgba="1 0 0 0" type="sphere" group="0" name="stack_4_main_group_2_default_site" /></body>
+    </body>
+  </worldbody>
+<actuator /><sensor /><tendon /><equality /><contact /></mujoco>
