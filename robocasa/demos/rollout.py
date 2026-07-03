@@ -8,9 +8,16 @@ previously lived inside ``FloatingEEMPPI.solve``.
 
 The hand+fingers are treated as a floating mocap-driven body in a stripped scene
 that contains only the target object subtree and the hand/finger ghost geoms.
-We advance ``horizon_steps - 1`` approach steps of uniform size along
-``approach_world`` from the refined pose and track the object-cost
+We roll out for a fixed duration (``horizon_duration``) at ``1/sim_dt`` Hz,
+advancing the mocap pose along ``approach_world`` at a constant velocity
+(``approach_total_distance / horizon_duration``), and track the object-cost
 (||object_pos - target||^2) and penetration profile across the rollout.
+
+Why a fixed *duration* rather than a fixed *distance*: a short 1 cm probe can
+be "improved" by candidates that only momentarily reduce the object cost via
+friction, then jam or unseat the object. A longer rollout (matching the
+``sim_dt`` / ``horizon`` cadence used by ``retargeting/utils/sampling.py``:
+``sim_dt=0.01``, so 0.5 s → 50 sim steps) exposes such transients.
 
 Typical usage from a caller such as ``_solve_contact_poses_with_skeleton`` in
 ``demos/demo_close_drawer_contact_curobo.py``::
@@ -59,9 +66,15 @@ from robocasa.demos.ee_floating_mppi import (  # noqa: E402
 @dataclass
 class RolloutConfig:
     device: str = "cuda:0"
-    sim_dt: float = 0.005
-    horizon_steps: int = 5  # 1 hold (the refined pose) + 4 approach steps
-    approach_total_distance: float = 0.01
+    # 20 Hz × 1.5 s rollout: gives friction-driven "stuck-inside-drawer" poses
+    # enough time for the closing drawer wall to catch up to the EE, so the
+    # score's rebound term can fire.
+    sim_dt: float = 0.05
+    horizon_steps: int = 30
+    # Sized so the rollout would ideally close the drawer within horizon_steps.
+    # The caller sets this to the task's actual push_distance (drawer travel to
+    # fully closed), so per-step displacement is that / (horizon_steps - 1).
+    approach_total_distance: float = 0.15
     object_improvement_eps: float = 1e-5
     contact_stiffness: float = 0.2
     contact_damping: float = 0.001
@@ -69,9 +82,24 @@ class RolloutConfig:
     njmax_per_env: int = 500
     compile_cuda_graph: bool = False
     prefer_comfree: bool = True
+    # --- score formula weights ---------------------------------------------
+    # score = Σ γ^t · progress[t]  +  λ · late_min_bonus  −  μ · rebound
+    # where progress[t] = cost[0] − cost[t],
+    #       late_min_bonus = cost[0] − min(cost[T/2:T]),
+    #       rebound = max(0, cost[T-1] − min(cost[T/2:T])).
+    # Everything is in cost units (m^2). See score_normalized below for a
+    # unitless threshold.
+    score_gamma: float = 0.95
+    score_late_weight: float = 5.0
+    score_rebound_weight: float = 10.0
+    # score_normalized = score / (cost[0] · horizon_steps). Represents the
+    # average fraction of the initial object-target gap that the rollout closed
+    # each step. Threshold is applied by the caller (default suggestion ~0.15).
+    score_accept_threshold: float = 0.15
 
     def post_init(self) -> None:
         assert self.horizon_steps >= 1
+        assert self.sim_dt > 0.0
 
 
 @dataclass(frozen=True)
@@ -90,6 +118,19 @@ class RolloutResult:
     object_cost_delta: float  # object_cost_min - object_cost_step0
     max_penetration: float
     steps: int
+    # Composite score (see RolloutConfig for the formula). Positive score
+    # means the rollout made real progress on the object task; the rebound
+    # term drives it back toward zero when the drawer catches the EE.
+    score: float
+    # score / (cost[0] · horizon_steps). Unitless — compare to
+    # RolloutConfig.score_accept_threshold.
+    score_normalized: float
+    # Diagnostic breakdown of the three score terms (in cost units, before
+    # weights are applied): discounted-progress sum, late-window min bonus,
+    # tail rebound magnitude. Useful for logging why a candidate was rejected.
+    score_progress_sum: float
+    score_late_min_bonus: float
+    score_rebound: float
 
 
 # ---------------------------------------------------------------------------
@@ -369,18 +410,25 @@ class FloatingEERollout:
         quat_wxyz = np.zeros(4, dtype=np.float64)
         mujoco.mju_mat2Quat(quat_wxyz, refined_rot.reshape(9))
 
-        step_dist = cfg.approach_total_distance / max(1, cfg.horizon_steps - 1)
+        horizon_steps = int(cfg.horizon_steps)
+        # Constant EE velocity = approach_total_distance / (horizon_steps · sim_dt).
+        # At 30 steps × 0.05 s that's push_distance / 1.5 s exactly. The j-th
+        # sample sits at the mocap pose reached after j sim-steps of that
+        # velocity, so j=0 is the hold pose and j=horizon_steps-1 is one
+        # sim-step short of the full push distance — over the whole rollout
+        # duration horizon_steps·sim_dt the EE traverses approach_total_distance.
+        step_dist = cfg.approach_total_distance / max(1, horizon_steps)
         target = self.target_object_position
 
-        object_costs = np.zeros(int(cfg.horizon_steps), dtype=np.float64)
-        object_positions = np.zeros((int(cfg.horizon_steps), 3), dtype=np.float64)
-        penetrations = np.zeros(int(cfg.horizon_steps), dtype=np.float64)
+        object_costs = np.zeros(horizon_steps, dtype=np.float64)
+        object_positions = np.zeros((horizon_steps, 3), dtype=np.float64)
+        penetrations = np.zeros(horizon_steps, dtype=np.float64)
 
         def _cost(pos: np.ndarray) -> float:
             d = np.asarray(pos, dtype=np.float64).reshape(3) - target
             return float(d.dot(d))
 
-        for j in range(int(cfg.horizon_steps)):
+        for j in range(horizon_steps):
             pos_j = refined_xyz + j * step_dist * self.approach_world
             self._write_mocap_pose(
                 pos_j,
@@ -405,6 +453,31 @@ class FloatingEERollout:
         obj_delta = obj_min - step0
         max_pen = float(np.max(penetrations))
 
+        # --- composite score --------------------------------------------------
+        # progress[t] = cost[0] - cost[t]; positive when the drawer is closer
+        # to the target than at the hold step. Discounted sum rewards early
+        # progress so friction-dragged candidates (drawer only creeps late)
+        # score lower than genuine pushes (drawer moves immediately).
+        progress = step0 - object_costs
+        discount = cfg.score_gamma ** np.arange(horizon_steps, dtype=np.float64)
+        progress_sum = float(np.dot(discount, progress))
+        # Late-window min: best cost achieved in the second half. Absorbs the
+        # inertia tail where a good push overshoots by a hair.
+        half = max(horizon_steps // 2, 1)
+        late_min = float(np.min(object_costs[half:])) if horizon_steps > 1 else step0
+        late_min_bonus = step0 - late_min
+        # Rebound: how much cost rose from that late-window min to the terminal
+        # step. Non-zero exactly when the drawer wall caught the EE and dragged
+        # the object back — the canonical "stuck" signature.
+        rebound = max(0.0, obj_final - late_min)
+        score = (
+            progress_sum
+            + float(cfg.score_late_weight) * late_min_bonus
+            - float(cfg.score_rebound_weight) * rebound
+        )
+        denom = max(step0 * float(horizon_steps), 1e-12)
+        score_normalized = float(score / denom)
+
         return RolloutResult(
             object_costs=object_costs.copy(),
             object_positions=object_positions.copy(),
@@ -414,7 +487,12 @@ class FloatingEERollout:
             object_cost_final=obj_final,
             object_cost_delta=obj_delta,
             max_penetration=max_pen,
-            steps=int(cfg.horizon_steps),
+            steps=horizon_steps,
+            score=float(score),
+            score_normalized=score_normalized,
+            score_progress_sum=float(progress_sum),
+            score_late_min_bonus=float(late_min_bonus),
+            score_rebound=float(rebound),
         )
 
 

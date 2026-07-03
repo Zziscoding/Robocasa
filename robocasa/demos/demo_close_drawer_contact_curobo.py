@@ -2676,12 +2676,20 @@ def _solve_contact_poses_with_skeleton(
                 object_body_id=int(_drawer_body_id),
                 ee_site_name=frame_name,
                 config=RolloutConfig(
-                    horizon_steps=int(getattr(args, "autogen_qmppi_horizon_steps", 5)),
+                    sim_dt=float(getattr(args, "autogen_qmppi_sim_dt", 0.05)),
+                    horizon_steps=int(getattr(args, "autogen_qmppi_horizon_steps", 30)),
                     approach_total_distance=float(
-                        getattr(args, "autogen_qmppi_approach_total_distance", 0.01)
+                        getattr(
+                            args,
+                            "autogen_qmppi_approach_total_distance",
+                            float(push_distance),
+                        )
                     ),
                     object_improvement_eps=float(
                         getattr(args, "autogen_qmppi_object_improvement_eps", 1e-5)
+                    ),
+                    score_accept_threshold=float(
+                        getattr(args, "autogen_qmppi_score_accept_threshold", 0.15)
                     ),
                 ),
                 approach_world=_normalize(force_direction, fallback=panel.push_world),
@@ -3125,65 +3133,83 @@ def _solve_contact_poses_with_skeleton(
         precompute_pose_indices = [
             int(pose_index) for pose_index in order[:max_attempts]
         ]
-        outer_workers = max(
+        batch_workers = max(
             1,
             min(
                 int(getattr(args, "autogen_mink_parallel_workers", 1) or 1),
                 len(precompute_pose_indices),
             ),
         )
-        if _mink_q_checker is None:
-            outer_workers = 1
-        else:
-            outer_workers = min(
-                outer_workers,
-                int(getattr(_mink_q_checker, "num_workers", outer_workers)),
-            )
-        if outer_workers > 1:
+        if batch_workers > 1:
             _mink_q_outer_precomputed = True
             print(
                 _step2_text(
                     "mink",
-                    "MINK_Q_OUTER_PARALLEL_READY "
+                    "MINK_Q_BATCH_PARALLEL_READY "
                     f"poses={len(precompute_pose_indices)} "
-                    f"workers={outer_workers} "
-                    f"inner_workers=1 "
+                    f"ik_workers={batch_workers} "
                     f"mink_solver={getattr(args, 'mink_solver', None)} "
-                    f"checker=batched_mjwarp_pool "
+                    f"checker={'full_scene_mjwarp_pool' if _mink_q_checker is not None else 'mujoco_env'} "
                     f"checker_workers={getattr(_mink_q_checker, 'num_workers', None)} "
                     f"worlds_per_worker={locals().get('_mink_q_worlds_per_worker')}",
                 ),
                 file=sys.__stdout__,
                 flush=True,
             )
-
-            def _precompute_mink_q_pose(pose_index):
-                try:
-                    _, _, _, result = _solve_mink_q_for_pose_index(
-                        int(pose_index),
-                        scene_checker=_mink_q_checker,
-                        max_workers_override=1,
-                        serial_env=False,
+            try:
+                batch_entries = []
+                for pose_index in precompute_pose_indices:
+                    candidate_index, skeleton_pose = skeleton_poses[int(pose_index)]
+                    retreat_normal = np.asarray(
+                        getattr(
+                            skeleton_pose,
+                            "contact_normal_world",
+                            panel.outward_world,
+                        ),
+                        dtype=np.float64,
+                    ).reshape(3)
+                    if float(np.dot(retreat_normal, panel.outward_world)) < 0.0:
+                        retreat_normal = -retreat_normal
+                    batch_entries.append(
+                        (int(pose_index), skeleton_pose, retreat_normal.copy())
                     )
-                    return int(pose_index), result, None
-                except Exception as exc:
-                    return int(pose_index), None, exc
-
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=outer_workers
-            ) as executor:
-                futures = [
-                    executor.submit(_precompute_mink_q_pose, pose_index)
-                    for pose_index in precompute_pose_indices
-                ]
-                for future in concurrent.futures.as_completed(futures):
-                    pose_index, result, exc = future.result()
-                    if exc is None:
-                        _mink_q_debug_parallel_results[int(pose_index)] = result
-                    else:
-                        _mink_q_parallel_exceptions[int(pose_index)] = exc
+                batch_results = mink_q.solve_skeleton_precontact_q_batch(
+                    env,
+                    robot_model=robot_model,
+                    arm_joint_names=arm_joint_names,
+                    frame_name=frame_name,
+                    pose_entries=batch_entries,
+                    q_start=q_robot_start,
+                    q_posture=q_posture,
+                    posture_cost=posture_cost,
+                    args=args,
+                    scene_checker=_mink_q_checker,
+                    penetration_checker=lambda q_arm: _strict_robot_drawer_penetration(
+                        env, arm_joint_names, q_arm
+                    ),
+                    scene_collision_checker=lambda q_arm: _check_arm_q_collision(
+                        env,
+                        panel,
+                        arm_joint_names,
+                        q_arm,
+                        allowed_ee_geom_name=None,
+                        penetration_tolerance=_mink_q_scene_pen_tol,
+                    ),
+                    max_workers=batch_workers,
+                )
+                for pose_index in precompute_pose_indices:
+                    _mink_q_debug_parallel_results[int(pose_index)] = batch_results[
+                        int(pose_index)
+                    ]
                     if _tqdm_pbar is not None:
                         _tqdm_pbar.update(1)
+            except Exception as exc:
+                _mink_q_outer_precomputed = False
+                sys.stderr.write(
+                    "[close_drawer] mink_q batch precompute failed "
+                    f"({exc!r}); falling back to per-pose solver.\n"
+                )
+                sys.stderr.flush()
 
     step2_iter = (
         order[:max_attempts]
@@ -3214,6 +3240,9 @@ def _solve_contact_poses_with_skeleton(
             _obj_eps = float(
                 getattr(args, "autogen_qmppi_object_improvement_eps", 1e-5)
             )
+            _score_thresh = float(
+                getattr(args, "autogen_qmppi_score_accept_threshold", 0.15)
+            )
             if solve_step2 == "mppi" and floating_mppi is not None:
                 attempted_floating_ee_count += 1
                 _skel_quat = np.zeros(4, dtype=np.float64)
@@ -3243,15 +3272,19 @@ def _solve_contact_poses_with_skeleton(
                 # drawer toward the target? Owned by FloatingEERollout (demos/rollout.py).
                 _rollout = _get_rollout(force_direction)
                 _obj_delta = 0.0
+                _score_norm = float("nan")
+                _score_rebound = float("nan")
                 if _rollout is not None:
                     _rollout_res = _rollout.run(refined_pos, refined_rot, refined_g)
                     _obj_delta = float(_rollout_res.object_cost_delta)
+                    _score_norm = float(_rollout_res.score_normalized)
+                    _score_rebound = float(_rollout_res.score_rebound)
                     floating_obj_delta_values.append(_obj_delta)
                     best_floating_obj_delta = min(
                         float(best_floating_obj_delta), _obj_delta
                     )
                     obj_improved = bool(
-                        np.isfinite(_obj_delta) and _obj_delta < -_obj_eps
+                        np.isfinite(_score_norm) and _score_norm > _score_thresh
                     )
                 else:
                     _obj_delta = float("nan")
@@ -3283,10 +3316,12 @@ def _solve_contact_poses_with_skeleton(
                     elif not obj_improved:
                         if _rollout is None:
                             _reason = "floating_rollout_unavailable"
-                        elif not np.isfinite(_obj_delta):
+                        elif not np.isfinite(_score_norm):
                             _reason = "floating_rollout_nan"
+                        elif _score_rebound > 0.0:
+                            _reason = "floating_rollout_rebound"
                         else:
-                            _reason = "floating_rollout_no_improvement"
+                            _reason = "floating_rollout_low_score"
                     else:
                         _reason = "floating_reject"
                     floating_reject_reasons[_reason] = (
@@ -3772,12 +3807,20 @@ def _solve_contact_poses_with_skeleton(
                 np.asarray(entry["force_direction"], dtype=np.float64)
             )
             _obj_delta = float("nan")
+            _score_norm = float("nan")
+            _score_rebound = float("nan")
             if _rollout is not None:
                 _rollout_res = _rollout.run(refined_pos, refined_rot, refined_g)
                 _obj_delta = float(_rollout_res.object_cost_delta)
+                _score_norm = float(_rollout_res.score_normalized)
+                _score_rebound = float(_rollout_res.score_rebound)
                 mink_q_obj_delta_values.append(_obj_delta)
                 best_mink_q_obj_delta = min(float(best_mink_q_obj_delta), _obj_delta)
-                obj_improved = bool(np.isfinite(_obj_delta) and _obj_delta < -_obj_eps)
+                obj_improved = bool(
+                    np.isfinite(_score_norm)
+                    and _score_norm
+                    > float(getattr(args, "autogen_qmppi_score_accept_threshold", 0.15))
+                )
             else:
                 mink_q_obj_delta_values.append(_obj_delta)
                 obj_improved = False
@@ -3785,10 +3828,12 @@ def _solve_contact_poses_with_skeleton(
                 mink_rollout_rejected_count += 1
                 if _rollout is None:
                     _reason = "mink_rollout_unavailable"
-                elif not np.isfinite(_obj_delta):
+                elif not np.isfinite(_score_norm):
                     _reason = "mink_rollout_nan"
+                elif _score_rebound > 0.0:
+                    _reason = "mink_rollout_rebound"
                 else:
-                    _reason = "mink_rollout_no_improvement"
+                    _reason = "mink_rollout_low_score"
                 mink_rollout_reject_reasons[_reason] = (
                     mink_rollout_reject_reasons.get(_reason, 0) + 1
                 )
@@ -3803,6 +3848,8 @@ def _solve_contact_poses_with_skeleton(
                             f"rot_err={rot_err:.6f} "
                             f"pen={max_pen:.6f} "
                             f"obj_delta={_obj_delta:.4e} "
+                            f"score_norm={_score_norm:.4e} "
+                            f"rebound={_score_rebound:.4e} "
                             f"retreat={float(entry['retreat_distance']):.6f}",
                         ),
                         flush=True,

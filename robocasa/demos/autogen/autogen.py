@@ -5,12 +5,11 @@ Reads a YAML config and dispatches to the right manipulation pipeline:
 1. Load YAML (defaults to ``open_drawer_contact_curobo.yaml``). The YAML's
    ``task_name`` field (e.g. ``open_drawer`` / ``close_drawer``) and/or
    ``drawer_action`` field selects scene + action.
-2. Build feasible contact candidates (delegated to the open-drawer autogen
-   pipeline, which is the generic COACD-based candidate generator).
-3. Run :func:`world_model.evaluate_prehensile_need` on those candidates.
-4. If ``use_prehens == 0`` → invoke ``demo_close_drawer_autogen.main`` (the
-   nonprehensile push pipeline). If ``use_prehens == 1`` → prehensile pipeline
-   placeholder (TODO).
+2. Run the world-model prehensile-need probe.
+3. If ``use_prehens == 0`` → invoke the modular close-drawer pipeline
+   (COACD → feasible candidates → DAQP skeleton poses → MPPI/mink step-2 →
+   rollout filtering → cuRobo trajectory, with 3 popup visualizations).
+   If ``use_prehens == 1`` → prehensile pipeline placeholder (TODO).
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
@@ -35,12 +35,11 @@ from robocasa.demos.demo_open_drawer_contact_curobo import (
 )
 from robocasa.demos import world_model as wm
 
+from .core.context import PipelineContext, autogen_print
+from .core.pipeline import get_stages, run_pipeline
+
 
 _DEFAULT_YAML = Path(__file__).with_name("open_drawer_contact_curobo.yaml")
-
-
-def _stdout_print(message: str) -> None:
-    print(f"[autogen] {message}", file=sys.__stdout__, flush=True)
 
 
 def _parse_cli() -> argparse.Namespace:
@@ -66,7 +65,6 @@ def _parse_cli() -> argparse.Namespace:
 
 def _resolve_task(config: dict, cli_override: str | None) -> tuple[str, str]:
     """Return (task_name, drawer_action). task_name is the high-level label."""
-
     task = (cli_override or config.get("task_name") or "").strip().lower()
     if not task:
         drawer_action = str(config.get("drawer_action", "open")).strip().lower()
@@ -84,7 +82,6 @@ def _run_world_model_probe(args, task_name: str) -> dict:
     extract the candidates, run the prehensile-need probe, and return early
     instead of going into curobo planning.
     """
-
     from robocasa.demos import demo_open_drawer_autogen as open_autogen
     from robocasa.demos import demo_open_drawer_contact_curobo as open_demo
 
@@ -108,8 +105,6 @@ def _run_world_model_probe(args, task_name: str) -> dict:
             expected_displacement=float(pull_distance),
         )
         probe_result.update(result)
-        # Short-circuit: raise a sentinel to stop the open-drawer pipeline
-        # cleanly after probing.
         raise _ProbeDone()
 
     base_globals = open_demo.main.__globals__
@@ -134,16 +129,38 @@ class _ProbeDone(Exception):
     pass
 
 
-def _dispatch_nonprehensile() -> None:
-    from robocasa.demos import demo_close_drawer_autogen
+def _dispatch_nonprehensile(args: argparse.Namespace) -> None:
+    """Run the modular close-drawer pipeline."""
+    autogen_print("dispatch=nonprehensile (modular close_drawer pipeline)")
+    from .core.args import parse_autogen_args
+    from robocasa.demos.demo_close_drawer_contact_curobo import (
+        parse_args as close_parse_args,
+    )
 
-    _stdout_print("dispatch=nonprehensile (close_drawer_autogen)")
-    demo_close_drawer_autogen.main()
+    # Parse args with autogen-specific defaults.
+    autogen_args = parse_autogen_args(close_parse_args)
+
+    # Merge any YAML-supplied overrides.
+    for key, value in vars(args).items():
+        if not hasattr(autogen_args, key):
+            setattr(autogen_args, key, value)
+
+    ctx = PipelineContext()
+    stages = get_stages("close_drawer", autogen_args)
+    started = time.perf_counter()
+    try:
+        run_pipeline(ctx, autogen_args, stages)
+    finally:
+        elapsed = time.perf_counter() - started
+        autogen_print(f"pipeline_done elapsed_s={elapsed:.3f}")
+        try:
+            ctx.env.close()
+        except Exception:
+            pass
 
 
 def _dispatch_prehensile() -> None:
-    _stdout_print("dispatch=prehensile (TODO: implement)")
-    # Intentionally left as a stub per spec.
+    autogen_print("dispatch=prehensile (TODO: implement)")
 
 
 def main() -> None:
@@ -165,17 +182,17 @@ def main() -> None:
     config.setdefault("world_model_device", "cuda:0")
 
     args = argparse.Namespace(**config)
-    _stdout_print(f"task_name={task_name} drawer_action={drawer_action}")
+    autogen_print(f"task_name={task_name} drawer_action={drawer_action}")
 
     probe = _run_world_model_probe(args, task_name)
     use_prehens = int(probe.get("use_prehens", 0))
-    _stdout_print(
+    autogen_print(
         f"world_model.use_prehens={use_prehens} "
         f"ratio={probe.get('ratio', float('nan')):.3f}"
     )
 
     if use_prehens == 0:
-        _dispatch_nonprehensile()
+        _dispatch_nonprehensile(args)
     else:
         _dispatch_prehensile()
 

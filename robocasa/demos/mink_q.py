@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import multiprocessing
+import os
+import sys
+import tempfile
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -10,6 +16,248 @@ import numpy as np
 
 
 _MINK_MODEL_SYNC_LOCK = threading.Lock()
+
+
+# --- Process pool for mink IK -------------------------------------------------
+# The IK worker used to run inside a ThreadPoolExecutor, but the mink solver is
+# pure Python + numpy and hits the GIL; N threads collapse to ~1 core. We now
+# lazily create a ProcessPoolExecutor and route parallel IK jobs through it.
+# Because MuJoCo MjData is not picklable and env.sim carries live state, the
+# process worker rebuilds its own robot-only MjModel from a cached .mjb file.
+# If anything fails (model can't be serialized, spawn fails, etc.) callers fall
+# back to the thread pool so the demo keeps running.
+_PROCESS_POOL: "concurrent.futures.ProcessPoolExecutor | None" = None
+_PROCESS_POOL_LOCK = threading.Lock()
+_PROCESS_POOL_DISABLED = False
+_PROCESS_POOL_MODEL_KEY: "str | None" = None
+_PROCESS_POOL_MODEL_FILES: dict[str, str] = {}
+
+# Per-worker state (populated in the child by _init_ik_worker).
+_WORKER_ROBOT_MODEL = None
+_WORKER_ROBOT_MODEL_PATH: "str | None" = None
+
+
+def _init_ik_worker(model_path: str) -> None:
+    """ProcessPoolExecutor initializer: build robot_model once per process."""
+    global _WORKER_ROBOT_MODEL, _WORKER_ROBOT_MODEL_PATH
+    try:
+        import mujoco
+
+        _WORKER_ROBOT_MODEL_PATH = str(model_path)
+        _WORKER_ROBOT_MODEL = mujoco.MjModel.from_binary_path(str(model_path))
+    except Exception as exc:  # pragma: no cover -- init failure surfaced to main
+        _WORKER_ROBOT_MODEL = None
+        _WORKER_ROBOT_MODEL_PATH = None
+        print(f"[mink_q] worker init failed: {exc!r}", file=sys.stderr)
+
+
+def _model_bytes_key(robot_model) -> str:
+    """Compact signature for a robot-only MuJoCo model after base-pose sync."""
+    digest = hashlib.sha1()
+    for value in (
+        getattr(robot_model, "nq", 0),
+        getattr(robot_model, "nv", 0),
+        getattr(robot_model, "nbody", 0),
+        getattr(robot_model, "njnt", 0),
+        getattr(robot_model, "nsite", 0),
+        getattr(robot_model, "ngeom", 0),
+    ):
+        digest.update(str(int(value)).encode("ascii"))
+        digest.update(b"|")
+    for name in ("qpos0", "body_pos", "body_quat", "jnt_range", "names"):
+        value = getattr(robot_model, name, None)
+        if value is None:
+            continue
+        if isinstance(value, (bytes, bytearray)):
+            digest.update(bytes(value))
+        else:
+            arr = np.ascontiguousarray(np.asarray(value))
+            digest.update(str(arr.dtype).encode("ascii"))
+            digest.update(str(arr.shape).encode("ascii"))
+            digest.update(arr.tobytes())
+    return digest.hexdigest()
+
+
+def _prepare_process_model(env, robot_model) -> tuple[str, str] | None:
+    """Export the robot-only MjModel to a persistent MJB for process workers."""
+    try:
+        import mujoco
+    except Exception:
+        return None
+    with _MINK_MODEL_SYNC_LOCK:
+        _sync_mink_base_pose(env, robot_model)
+        key = _model_bytes_key(robot_model)
+        path = _PROCESS_POOL_MODEL_FILES.get(key)
+        if path is not None and os.path.exists(path):
+            return key, path
+        fd, path = tempfile.mkstemp(prefix="mink_robot_model_", suffix=".mjb")
+        os.close(fd)
+        try:
+            mujoco.mj_saveModel(robot_model, path, None)
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+        _PROCESS_POOL_MODEL_FILES[key] = path
+        return key, path
+
+
+def _get_or_create_process_pool(
+    model_key: str, model_path: str, requested_workers: int | None = None
+) -> "concurrent.futures.ProcessPoolExecutor | None":
+    """Return the shared process pool (creating it lazily), or None on failure."""
+    global _PROCESS_POOL, _PROCESS_POOL_DISABLED, _PROCESS_POOL_MODEL_KEY
+    if _PROCESS_POOL_DISABLED:
+        return None
+    with _PROCESS_POOL_LOCK:
+        if _PROCESS_POOL_DISABLED:
+            return None
+        # If the model changed identity (e.g. a new env was constructed) we
+        # tear down the old pool so the new MJB gets pushed to fresh workers.
+        if _PROCESS_POOL is not None and _PROCESS_POOL_MODEL_KEY != model_key:
+            try:
+                _PROCESS_POOL.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            _PROCESS_POOL = None
+            _PROCESS_POOL_MODEL_KEY = None
+        if _PROCESS_POOL is None:
+            try:
+                # Use fork on Linux so workers do not re-import the demo script
+                # as __main__.  The IK worker builds its own robot-only MjModel
+                # from MJB and does not touch the parent env.sim MjData, so this
+                # avoids spawn-time robocasa/robosuite import side effects while
+                # keeping worker state independent.
+                try:
+                    ctx = multiprocessing.get_context("fork")
+                except ValueError:
+                    ctx = multiprocessing.get_context("spawn")
+                cpu_cap = os.cpu_count() or 2
+                if requested_workers is not None and int(requested_workers) > 0:
+                    max_workers = max(1, min(int(requested_workers), cpu_cap))
+                else:
+                    max_workers = max(1, min(16, cpu_cap))
+                _PROCESS_POOL = concurrent.futures.ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    mp_context=ctx,
+                    initializer=_init_ik_worker,
+                    initargs=(model_path,),
+                )
+                _PROCESS_POOL_MODEL_KEY = model_key
+            except Exception as exc:
+                warnings.warn(
+                    f"[mink_q] ProcessPoolExecutor creation failed ({exc!r}); "
+                    "falling back to ThreadPoolExecutor.",
+                    RuntimeWarning,
+                )
+                _PROCESS_POOL = None
+                _PROCESS_POOL_DISABLED = True
+                return None
+        return _PROCESS_POOL
+
+
+def _disable_process_pool(reason: str) -> None:
+    global _PROCESS_POOL, _PROCESS_POOL_DISABLED, _PROCESS_POOL_MODEL_KEY
+    with _PROCESS_POOL_LOCK:
+        if _PROCESS_POOL is not None:
+            try:
+                _PROCESS_POOL.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        _PROCESS_POOL = None
+        _PROCESS_POOL_MODEL_KEY = None
+        _PROCESS_POOL_DISABLED = True
+    warnings.warn(
+        f"[mink_q] process pool disabled; falling back to threads: {reason}",
+        RuntimeWarning,
+    )
+
+
+def _process_worker_solve(payload: dict) -> tuple:
+    """Picklable worker: runs mink IK in a child process using the pre-built
+    per-process robot_model. Payload must contain only picklable primitives."""
+    import mink  # noqa: F401 -- ensure mink is importable in worker
+
+    global _WORKER_ROBOT_MODEL
+    if _WORKER_ROBOT_MODEL is None:
+        # Late init in case the initializer never ran (shouldn't happen).
+        model_path = payload.get("model_path")
+        if model_path:
+            _init_ik_worker(str(model_path))
+    robot_model = _WORKER_ROBOT_MODEL
+    if robot_model is None:
+        raise RuntimeError("mink_q worker: robot_model unavailable")
+
+    configuration = mink.Configuration(robot_model)
+    configuration.update(np.asarray(payload["q_start"], dtype=np.float64).copy())
+
+    posture_task = mink.PostureTask(
+        robot_model,
+        cost=np.asarray(payload["posture_cost"], dtype=np.float64),
+        lm_damping=float(payload["mink_posture_lm_damping"]),
+    )
+    posture_task.set_target(np.asarray(payload["q_posture"], dtype=np.float64).copy())
+
+    frame_task = mink.FrameTask(
+        frame_name=str(payload["frame_name"]),
+        frame_type="site",
+        position_cost=float(payload["mink_position_cost"]),
+        orientation_cost=float(payload["mink_orientation_cost"]),
+        lm_damping=float(payload["mink_frame_lm_damping"]),
+    )
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = np.asarray(payload["target_rot"], dtype=np.float64).reshape(3, 3)
+    pose[:3, 3] = np.asarray(payload["target_pos"], dtype=np.float64).reshape(3)
+    frame_task.set_target(mink.SE3.from_matrix(pose))
+
+    tasks = [posture_task, frame_task]
+    last_pos_error = float("inf")
+    for _ in range(int(payload["mink_max_iters"])):
+        velocity = mink.solve_ik(
+            configuration,
+            tasks,
+            float(payload["mink_dt"]),
+            payload["mink_solver"],
+            float(payload["mink_damping"]),
+        )
+        configuration.integrate_inplace(velocity, float(payload["mink_dt"]))
+        try:
+            transform = configuration.get_transform_frame_to_world(
+                str(payload["frame_name"]), "site"
+            )
+            actual_pos = np.asarray(transform.as_matrix()[:3, 3], dtype=np.float64)
+        except Exception:
+            break
+        last_pos_error = float(
+            np.linalg.norm(actual_pos - np.asarray(payload["target_pos"]))
+        )
+        if last_pos_error <= float(payload["mink_position_tolerance"]):
+            break
+    return configuration.q.copy(), last_pos_error
+
+
+def _build_worker_payload(
+    frame_name, target_pos, target_rot, q_start, q_posture, posture_cost, args
+) -> dict:
+    return {
+        "frame_name": str(frame_name),
+        "target_pos": np.asarray(target_pos, dtype=np.float64).copy(),
+        "target_rot": np.asarray(target_rot, dtype=np.float64).copy(),
+        "q_start": np.asarray(q_start, dtype=np.float64).copy(),
+        "q_posture": np.asarray(q_posture, dtype=np.float64).copy(),
+        "posture_cost": np.asarray(posture_cost, dtype=np.float64).copy(),
+        "mink_posture_lm_damping": float(args.mink_posture_lm_damping),
+        "mink_position_cost": float(args.mink_position_cost),
+        "mink_orientation_cost": float(args.mink_orientation_cost),
+        "mink_frame_lm_damping": float(args.mink_frame_lm_damping),
+        "mink_max_iters": int(args.mink_max_iters),
+        "mink_dt": float(args.mink_dt),
+        "mink_solver": args.mink_solver,
+        "mink_damping": float(args.mink_damping),
+        "mink_position_tolerance": float(args.mink_position_tolerance),
+    }
 
 
 @dataclass(frozen=True)
@@ -561,12 +809,60 @@ def solve_skeleton_precontact_q_parallel(
     if workers <= 1:
         results = [_run(job) for job in jobs]
     else:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, min(workers, len(jobs)))
-        ) as executor:
-            futures = [executor.submit(_run, job) for job in jobs]
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
+        # Try process pool first; fall back to threads on any failure.
+        used_process_pool = False
+        model_spec = _prepare_process_model(env, robot_model)
+        if model_spec is not None:
+            pool = _get_or_create_process_pool(
+                model_spec[0], model_spec[1], requested_workers=workers
+            )
+            if pool is not None:
+                try:
+                    proc_futures = {}
+                    for job in jobs:
+                        payload = _build_worker_payload(
+                            frame_name,
+                            job[2],
+                            target_rot,
+                            q_start,
+                            q_posture,
+                            posture_cost,
+                            args,
+                        )
+                        proc_futures[pool.submit(_process_worker_solve, payload)] = job
+                    for future in concurrent.futures.as_completed(proc_futures):
+                        job = proc_futures[future]
+                        try:
+                            q_robot, position_error = future.result()
+                            results.append((job, q_robot, float(position_error), None))
+                        except Exception as exc:
+                            results.append(
+                                (
+                                    job,
+                                    np.asarray(q_start, dtype=np.float64).copy(),
+                                    float("inf"),
+                                    exc,
+                                )
+                            )
+                    used_process_pool = True
+                except Exception as exc:
+                    _disable_process_pool(f"submit/collect failed: {exc!r}")
+                    results = []
+            if (
+                used_process_pool
+                and results
+                and all(item[3] is not None for item in results)
+            ):
+                _disable_process_pool("all process IK jobs failed")
+                used_process_pool = False
+                results = []
+        if not used_process_pool:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(workers, len(jobs)))
+            ) as executor:
+                futures = [executor.submit(_run, job) for job in jobs]
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
     result_by_multiplier = {
         job[0]: (job, q_robot, position_error, exc)
         for job, q_robot, position_error, exc in results
@@ -778,6 +1074,384 @@ def solve_skeleton_precontact_q_parallel(
     )
 
 
+def solve_skeleton_precontact_q_batch(
+    env,
+    *,
+    robot_model,
+    arm_joint_names: Sequence[str],
+    frame_name: str,
+    pose_entries: Sequence[tuple[int, Any, np.ndarray | None]],
+    q_start: np.ndarray,
+    q_posture: np.ndarray,
+    posture_cost: np.ndarray,
+    args,
+    scene_checker: Any | None = None,
+    penetration_checker: Callable[[np.ndarray], tuple[float, str]] | None = None,
+    scene_collision_checker: Callable[[np.ndarray], tuple[bool, str]] | None = None,
+    max_workers: int | None = None,
+) -> dict[int, MinkQResult]:
+    """Solve many skeleton precontact IK problems in one process-pool batch.
+
+    ``scene_checker`` is expected to be the full-scene checker pool from
+    ``full_scene_mjwarp.py``.  It is intentionally evaluated after all IK jobs
+    finish so GPU full-scene collision checks can be batched across poses.
+    """
+    entries = [
+        (int(pose_index), skeleton_pose, retreat_direction_world)
+        for pose_index, skeleton_pose, retreat_direction_world in pose_entries
+    ]
+    if not entries:
+        return {}
+    workers = int(max_workers or getattr(args, "autogen_mink_parallel_workers", 1))
+    workers = max(workers, 1)
+    arm_joint_names = tuple(arm_joint_names)
+    base_distance = float(
+        getattr(
+            args,
+            "mink_q_precontact_distance",
+            min(max(float(getattr(args, "contact_standoff", 0.005)), 0.003), 0.008),
+        )
+    )
+    multipliers = _parse_multipliers(
+        getattr(args, "mink_q_retreat_distance_multipliers", None)
+    )
+    if not multipliers:
+        raise RuntimeError("mink_q received no retreat-distance candidates")
+    position_tolerance = float(
+        getattr(args, "mink_q_position_tolerance", float(args.mink_position_tolerance))
+        or float(args.mink_position_tolerance)
+    )
+    raw_pen_tol = getattr(args, "mink_q_collision_penetration_tolerance", None)
+    penetration_tolerance = (
+        min(float(getattr(args, "mink_collision_penetration_tolerance", 0.0)), 1e-4)
+        if raw_pen_tol is None
+        else float(raw_pen_tol)
+    )
+
+    jobs: list[dict[str, Any]] = []
+    entry_by_pose_index = {}
+    for pose_index, skeleton_pose, retreat_direction_world in entries:
+        entry_by_pose_index[int(pose_index)] = skeleton_pose
+        target_rot = np.asarray(skeleton_pose.ee_rotation, dtype=np.float64).reshape(
+            3, 3
+        )
+        contact_pos = np.asarray(skeleton_pose.ee_position, dtype=np.float64).reshape(3)
+        fallback_dir = np.asarray(
+            getattr(skeleton_pose, "contact_normal_world", np.array([1.0, 0.0, 0.0])),
+            dtype=np.float64,
+        ).reshape(3)
+        retreat_dir = _normalize(
+            fallback_dir
+            if retreat_direction_world is None
+            else retreat_direction_world,
+            fallback=fallback_dir,
+        )
+        for local_job_index, multiplier in enumerate(multipliers):
+            retreat_distance = max(float(base_distance) * float(multiplier), 0.0)
+            target_pos = contact_pos + retreat_dir * retreat_distance
+            jobs.append(
+                {
+                    "global_index": len(jobs),
+                    "local_job_index": int(local_job_index),
+                    "pose_index": int(pose_index),
+                    "multiplier": float(multiplier),
+                    "retreat_distance": float(retreat_distance),
+                    "target_pos": np.asarray(target_pos, dtype=np.float64).copy(),
+                    "target_rot": np.asarray(target_rot, dtype=np.float64).copy(),
+                }
+            )
+    if not jobs:
+        return {}
+
+    def _thread_run(job: dict[str, Any]):
+        try:
+            q_robot, position_error = _solve_frame_pose_parallel_worker(
+                env,
+                robot_model,
+                frame_name,
+                job["target_pos"],
+                job["target_rot"],
+                q_start,
+                q_posture,
+                posture_cost,
+                args,
+                skip_sync_base_pose=True,
+            )
+            return int(job["global_index"]), q_robot, float(position_error), None
+        except Exception as exc:
+            return (
+                int(job["global_index"]),
+                np.asarray(q_start, dtype=np.float64).copy(),
+                float("inf"),
+                exc,
+            )
+
+    with _MINK_MODEL_SYNC_LOCK:
+        _sync_mink_base_pose(env, robot_model)
+
+    results_by_global: dict[int, tuple[np.ndarray, float, Exception | None]] = {}
+    used_process_pool = False
+    if workers > 1:
+        model_spec = _prepare_process_model(env, robot_model)
+        if model_spec is not None:
+            pool = _get_or_create_process_pool(
+                model_spec[0], model_spec[1], requested_workers=workers
+            )
+            if pool is not None:
+                try:
+                    futures = {}
+                    for job in jobs:
+                        payload = _build_worker_payload(
+                            frame_name,
+                            job["target_pos"],
+                            job["target_rot"],
+                            q_start,
+                            q_posture,
+                            posture_cost,
+                            args,
+                        )
+                        futures[pool.submit(_process_worker_solve, payload)] = int(
+                            job["global_index"]
+                        )
+                    for future in concurrent.futures.as_completed(futures):
+                        global_index = int(futures[future])
+                        try:
+                            q_robot, position_error = future.result()
+                            results_by_global[global_index] = (
+                                np.asarray(q_robot, dtype=np.float64).copy(),
+                                float(position_error),
+                                None,
+                            )
+                        except Exception as exc:
+                            results_by_global[global_index] = (
+                                np.asarray(q_start, dtype=np.float64).copy(),
+                                float("inf"),
+                                exc,
+                            )
+                    used_process_pool = True
+                except Exception as exc:
+                    _disable_process_pool(f"batch submit/collect failed: {exc!r}")
+                    results_by_global.clear()
+            if (
+                used_process_pool
+                and results_by_global
+                and all(item[2] is not None for item in results_by_global.values())
+            ):
+                _disable_process_pool("all batch process IK jobs failed")
+                used_process_pool = False
+                results_by_global.clear()
+
+    if not used_process_pool:
+        if workers <= 1:
+            thread_results = [_thread_run(job) for job in jobs]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(workers, len(jobs)))
+            ) as executor:
+                futures = [executor.submit(_thread_run, job) for job in jobs]
+                thread_results = [
+                    future.result()
+                    for future in concurrent.futures.as_completed(futures)
+                ]
+        for global_index, q_robot, position_error, exc in thread_results:
+            results_by_global[int(global_index)] = (
+                np.asarray(q_robot, dtype=np.float64).copy(),
+                float(position_error),
+                exc,
+            )
+
+    report_by_global: dict[int, Any] = {}
+    if scene_checker is not None:
+        q_entries: list[tuple[int, np.ndarray]] = []
+        for job in jobs:
+            q_robot, _, exc = results_by_global[int(job["global_index"])]
+            if exc is not None:
+                continue
+            q_arm = _arm_q_from_robot_model_q(robot_model, q_robot, arm_joint_names)
+            q_entries.append((int(job["global_index"]), q_arm))
+        if q_entries:
+            if hasattr(scene_checker, "evaluate_candidates"):
+                collision_reports = scene_checker.evaluate_candidates(
+                    [q_arm for _, q_arm in q_entries]
+                )
+            elif hasattr(scene_checker, "evaluate_candidates_threadsafe"):
+                collision_reports = scene_checker.evaluate_candidates_threadsafe(
+                    [q_arm for _, q_arm in q_entries]
+                )
+            else:
+                collision_reports = []
+                staged_world = {}
+                scene_checker.reset()
+                for global_index, q_arm in q_entries:
+                    staged_world[int(global_index)] = scene_checker.submit(q_arm)
+                scene_checker.evaluate()
+                for global_index, _ in q_entries:
+                    world_id = staged_world[int(global_index)]
+                    max_pen, pen_reason = scene_checker.penetration(world_id)
+                    scene_ok, scene_reason = scene_checker.scene_collision(world_id)
+                    ee_pos, ee_rot = scene_checker.ee_pose(world_id)
+                    collision_reports.append(
+                        type(
+                            "_MinkQCollisionReport",
+                            (),
+                            {
+                                "max_penetration": float(max_pen),
+                                "penetration_reason": str(pen_reason),
+                                "scene_collision_free": bool(scene_ok),
+                                "scene_reason": str(scene_reason),
+                                "ee_position": np.asarray(ee_pos, dtype=np.float64),
+                                "ee_rotation": np.asarray(ee_rot, dtype=np.float64),
+                            },
+                        )()
+                    )
+            if len(collision_reports) != len(q_entries):
+                raise RuntimeError(
+                    "scene_checker returned "
+                    f"{len(collision_reports)} reports for {len(q_entries)} candidates"
+                )
+            report_by_global = {
+                global_index: report
+                for (global_index, _), report in zip(q_entries, collision_reports)
+            }
+
+    jobs_by_pose: dict[int, list[dict[str, Any]]] = {}
+    for job in jobs:
+        jobs_by_pose.setdefault(int(job["pose_index"]), []).append(job)
+
+    results: dict[int, MinkQResult] = {}
+    for pose_index, pose_jobs in jobs_by_pose.items():
+        pose_jobs = sorted(pose_jobs, key=lambda item: int(item["local_job_index"]))
+        best: MinkQResult | None = None
+        attempts: list[MinkQAttempt] = []
+        for job in pose_jobs:
+            global_index = int(job["global_index"])
+            q_robot, position_error, exc = results_by_global[global_index]
+            q_arm = _arm_q_from_robot_model_q(robot_model, q_robot, arm_joint_names)
+            target_rot = np.asarray(job["target_rot"], dtype=np.float64).reshape(3, 3)
+            target_pos = np.asarray(job["target_pos"], dtype=np.float64).reshape(3)
+            if exc is None and global_index in report_by_global:
+                report = report_by_global[global_index]
+                actual_pos = np.asarray(report.ee_position, dtype=np.float64).reshape(3)
+                actual_rot = np.asarray(report.ee_rotation, dtype=np.float64).reshape(
+                    3, 3
+                )
+                rotation_error = _rotation_error(target_rot, actual_rot)
+                scene_ok = bool(report.scene_collision_free)
+                scene_reason = str(report.scene_reason)
+                max_pen = float(report.max_penetration)
+                pen_reason = str(report.penetration_reason)
+                collision_free = bool(scene_ok and max_pen <= penetration_tolerance)
+                if not scene_ok:
+                    reason = scene_reason
+                elif max_pen > penetration_tolerance:
+                    reason = f"drawer_penetration:{pen_reason}"
+                elif float(position_error) > position_tolerance:
+                    reason = "position_error"
+                else:
+                    reason = "success"
+            elif exc is None:
+                actual_pos, actual_rot = _site_pose_for_arm_q(
+                    env, arm_joint_names, q_arm, frame_name
+                )
+                rotation_error = _rotation_error(target_rot, actual_rot)
+                scene_ok = True
+                scene_reason = "collision_free"
+                if scene_collision_checker is not None:
+                    scene_ok, scene_reason = scene_collision_checker(q_arm)
+                max_pen = 0.0
+                pen_reason = "penetration_checker_unavailable"
+                if penetration_checker is not None:
+                    max_pen, pen_reason = penetration_checker(q_arm)
+                collision_free = bool(scene_ok and max_pen <= penetration_tolerance)
+                if not scene_ok:
+                    reason = str(scene_reason)
+                elif max_pen > penetration_tolerance:
+                    reason = f"drawer_penetration:{pen_reason}"
+                elif float(position_error) > position_tolerance:
+                    reason = "position_error"
+                else:
+                    reason = "success"
+            else:
+                actual_pos = np.full(3, np.nan, dtype=np.float64)
+                actual_rot = np.eye(3, dtype=np.float64)
+                rotation_error = float("inf")
+                max_pen = float("inf")
+                collision_free = False
+                reason = f"ik_exception:{exc.__class__.__name__}"
+
+            attempt = MinkQAttempt(
+                target_position_world=target_pos.copy(),
+                actual_position_world=np.asarray(actual_pos, dtype=np.float64).copy(),
+                actual_rotation_world=np.asarray(actual_rot, dtype=np.float64).copy(),
+                retreat_distance=float(job["retreat_distance"]),
+                position_error=float(position_error),
+                rotation_error=float(rotation_error),
+                max_penetration=float(max_pen),
+                collision_free=bool(collision_free),
+                reason=str(reason),
+            )
+            attempts.append(attempt)
+            result = MinkQResult(
+                arm_q=np.asarray(q_arm, dtype=np.float64).reshape(len(arm_joint_names)),
+                robot_q=np.asarray(q_robot, dtype=np.float64).copy(),
+                target_position_world=target_pos.copy(),
+                target_rotation_world=target_rot.copy(),
+                actual_position_world=np.asarray(actual_pos, dtype=np.float64).copy(),
+                actual_rotation_world=np.asarray(actual_rot, dtype=np.float64).copy(),
+                position_error=float(position_error),
+                rotation_error=float(rotation_error),
+                max_penetration=float(max_pen),
+                collision_free=bool(
+                    collision_free and float(position_error) <= position_tolerance
+                ),
+                collision_reason=str(reason),
+                retreat_distance=float(job["retreat_distance"]),
+                attempts=tuple(attempts),
+            )
+            if best is None:
+                best = result
+            else:
+                best_key = (
+                    0 if best.collision_free else 1,
+                    best.max_penetration,
+                    best.position_error,
+                    best.retreat_distance,
+                )
+                result_key = (
+                    0 if result.collision_free else 1,
+                    result.max_penetration,
+                    result.position_error,
+                    result.retreat_distance,
+                )
+                if result_key < best_key:
+                    best = result
+            if result.collision_free:
+                break
+        if best is None:
+            continue
+        results[int(pose_index)] = MinkQResult(
+            arm_q=best.arm_q,
+            robot_q=best.robot_q,
+            target_position_world=best.target_position_world,
+            target_rotation_world=best.target_rotation_world,
+            actual_position_world=best.actual_position_world,
+            actual_rotation_world=best.actual_rotation_world,
+            position_error=best.position_error,
+            rotation_error=best.rotation_error,
+            max_penetration=best.max_penetration,
+            collision_free=best.collision_free,
+            collision_reason=best.collision_reason,
+            retreat_distance=best.retreat_distance,
+            attempts=tuple(attempts),
+        )
+    missing = sorted(set(entry_by_pose_index) - set(results))
+    if missing:
+        raise RuntimeError(
+            f"mink_q batch produced no result for pose indices {missing}"
+        )
+    return results
+
+
 def solve_mink_for_drawer_candidate_parallel(
     env,
     panel,
@@ -916,12 +1590,59 @@ def solve_mink_for_drawer_candidate_parallel(
 
     results = []
     started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max(1, min(workers, len(jobs)))
-    ) as executor:
-        futures = [executor.submit(_run, job) for job in jobs]
-        for future in concurrent.futures.as_completed(futures):
-            results.append(future.result())
+    used_process_pool = False
+    model_spec = _prepare_process_model(env, robot_model)
+    if model_spec is not None:
+        pool = _get_or_create_process_pool(
+            model_spec[0], model_spec[1], requested_workers=workers
+        )
+        if pool is not None:
+            try:
+                proc_futures = {}
+                for job in jobs:
+                    payload = _build_worker_payload(
+                        frame_name,
+                        job[6],
+                        job[5],
+                        q_initial,
+                        q_posture,
+                        posture_cost,
+                        args,
+                    )
+                    proc_futures[pool.submit(_process_worker_solve, payload)] = job
+                for future in concurrent.futures.as_completed(proc_futures):
+                    job = proc_futures[future]
+                    try:
+                        q_contact, pos_error = future.result()
+                        results.append((job, q_contact, float(pos_error), None))
+                    except Exception as exc:
+                        results.append(
+                            (
+                                job,
+                                None,
+                                float("inf"),
+                                f"ik_exception:{exc.__class__.__name__}",
+                            )
+                        )
+                used_process_pool = True
+            except Exception as exc:
+                _disable_process_pool(f"submit/collect failed: {exc!r}")
+                results = []
+        if (
+            used_process_pool
+            and results
+            and all(item[3] is not None for item in results)
+        ):
+            _disable_process_pool("all process IK jobs failed")
+            used_process_pool = False
+            results = []
+    if not used_process_pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(workers, len(jobs)))
+        ) as executor:
+            futures = [executor.submit(_run, job) for job in jobs]
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
     result_by_key = {
         (job[0], job[4]): (job, q_contact, pos_error, error)
         for job, q_contact, pos_error, error in results

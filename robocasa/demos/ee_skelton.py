@@ -901,26 +901,79 @@ def solve_skeleton_pose(
                 if scene_geom_ids_set:
                     geomgroup = np.ones(6, dtype=np.uint8)
                     scene_distances = np.full(n_samples, np.inf, dtype=np.float64)
+
+                    # Pre-stack per-ray origins and directions. All rays share
+                    # the same direction (-b_w) but have distinct origins
+                    # (samples_w[si]), so mj_multiRay (single-origin, multi-vec)
+                    # cannot batch this case. We still preallocate the scratch
+                    # buffers and only fall through to mj_ray in a loop; the
+                    # per-iteration array allocations (previously the dominant
+                    # Python overhead) are eliminated. If a future MuJoCo build
+                    # exposes a per-origin batched raycast, we branch to it.
+                    pnts = np.ascontiguousarray(samples_w, dtype=np.float64)
+                    dir_shared = np.ascontiguousarray(-b_w, dtype=np.float64)
+                    vecs = np.broadcast_to(dir_shared, (n_samples, 3)).copy()
+                    geomid_out_batch = np.full(n_samples, -1, dtype=np.int32)
+                    dist_out_batch = np.full(n_samples, -1.0, dtype=np.float64)
+
+                    used_batch = False
+                    # Fast path: if all origins collapse to a single point
+                    # (numerically), we can use mj_multiRay.
+                    if hasattr(mujoco, "mj_multiRay"):
+                        origin_spread = float(
+                            np.max(np.linalg.norm(pnts - pnts[0:1], axis=1))
+                        )
+                        if origin_spread < 1e-9:
+                            try:
+                                normals_out = np.zeros(n_samples * 3, dtype=np.float64)
+                                mujoco.mj_multiRay(
+                                    raw_model,
+                                    raw_data,
+                                    pnts[0].copy(),
+                                    vecs.reshape(-1),
+                                    geomgroup,
+                                    1,
+                                    -1,
+                                    geomid_out_batch,
+                                    dist_out_batch,
+                                    normals_out,
+                                    int(n_samples),
+                                    -1.0,
+                                )
+                                used_batch = True
+                            except Exception:
+                                used_batch = False
+
+                    if not used_batch:
+                        # Preallocated per-ray scratch — no per-iteration
+                        # np.zeros / np.asarray churn.
+                        geomid_scratch = np.zeros(1, dtype=np.int32)
+                        for si in range(n_samples):
+                            try:
+                                geomid_scratch[0] = -1
+                                dist_val = mujoco.mj_ray(
+                                    raw_model,
+                                    raw_data,
+                                    pnts[si],
+                                    dir_shared,
+                                    geomgroup,
+                                    1,
+                                    -1,
+                                    geomid_scratch,
+                                )
+                            except Exception:
+                                dist_val = -1.0
+                                geomid_scratch[0] = -1
+                            dist_out_batch[si] = float(dist_val)
+                            geomid_out_batch[si] = int(geomid_scratch[0])
+
                     for si in range(n_samples):
-                        start = samples_w[si]
-                        direction = -b_w
-                        try:
-                            geomid_out = np.zeros(1, dtype=np.int32)
-                            dist = mujoco.mj_ray(
-                                raw_model,
-                                raw_data,
-                                np.asarray(start, dtype=np.float64),
-                                np.asarray(direction, dtype=np.float64),
-                                geomgroup,
-                                1,
-                                -1,
-                                geomid_out,
-                            )
-                        except Exception:
-                            dist = -1.0
-                            geomid_out = np.array([-1], dtype=np.int32)
-                        if dist > 0 and int(geomid_out[0]) in scene_geom_ids_set:
-                            scene_distances[si] = float(dist)
+                        d_val = float(dist_out_batch[si])
+                        if (
+                            d_val > 0
+                            and int(geomid_out_batch[si]) in scene_geom_ids_set
+                        ):
+                            scene_distances[si] = d_val
                     mask = np.isfinite(scene_distances)
                     if bool(np.any(mask)):
                         A_scene = np.zeros((int(np.sum(mask)), nvar), dtype=np.float64)
@@ -1282,6 +1335,185 @@ def solve_skeleton_pose_candidates(
     return list(poses or [])
 
 
+def solve_dual_finger_skeleton_pose(
+    env,
+    skeleton: EESkeleton,
+    left_contact_point: np.ndarray,
+    left_contact_normal: np.ndarray,
+    right_contact_point: np.ndarray,
+    right_contact_normal: np.ndarray,
+    *,
+    object_convex_equations: Optional[np.ndarray] = None,
+    object_convex_equation_mask: Optional[np.ndarray] = None,
+    scene_geom_ids: Optional[Sequence[int]] = None,
+    initial_ee_rotation_world: Optional[np.ndarray] = None,
+    args=None,
+) -> Optional[SkeletonPose]:
+    """Closed-form dual-contact skeleton pose for a two-finger wrap grasp.
+
+    Finds a single EE pose + gripper opening that places the left/right
+    finger *inner* surfaces at the two contact points simultaneously.  Unlike
+    ``solve_skeleton_pose`` (one contact point + one primitive, which
+    enforces "all hand samples on the +normal side of the contact tangent
+    plane"), this solver does NOT enforce that single-tangent-plane
+    half-space — the two fingers straddle the handle by construction, so the
+    non-contacting finger is legitimately on the -normal side.
+
+    The pose is fully determined by geometry:
+      * gripper opening  = contact separation + 2 * finger_radius
+      * rotation         aligns the EE-frame finger-separation axis with the
+                         world contact-separation axis, while keeping the
+                         approach direction close to ``initial_ee_rotation_world``
+      * position         places the left inner surface at the left contact point
+                         (the right inner surface then lands exactly on the right
+                         contact point by construction).
+
+    Returns ``None`` if the pose is infeasible (opening out of bounds, penetrates
+    the handle's COACD convex parts, or the two contact points are inconsistent
+    with a rigid gripper).
+    """
+    del scene_geom_ids  # scene clearance is enforced later by MPPI / rollout.
+
+    finger_radius = float(getattr(args, "autogen_skeleton_finger_radius", 0.004))
+    g_min = float(getattr(args, "autogen_skeleton_gripper_min", 0.005))
+    g_max = float(
+        getattr(args, "autogen_skeleton_gripper_max", PANDA_MAX_GRIPPER_OPENING)
+    )
+    penetration_tol = float(
+        getattr(args, "autogen_skeleton_object_penetration_tol", 0.001)
+    )
+
+    left_contact_point = np.asarray(left_contact_point, dtype=np.float64).reshape(3)
+    right_contact_point = np.asarray(right_contact_point, dtype=np.float64).reshape(3)
+    left_contact_normal = _normalize(left_contact_normal)
+    right_contact_normal = _normalize(right_contact_normal)
+
+    sep_w = left_contact_point - right_contact_point
+    dist_w = float(np.linalg.norm(sep_w))
+    if dist_w < 1e-6:
+        return None
+
+    # Inner-surface separation must match the contact-point separation, so the
+    # gripper opening (midpoint-to-midpoint) is the contact distance plus one
+    # finger radius on each side.
+    g = float(dist_w + 2.0 * finger_radius)
+    if g > g_max:
+        return None
+    if g < g_min:
+        return None
+
+    # Finger segments + inner-surface anchor points at this opening.
+    left_seg, right_seg, y_hat_ee, left_sign = _finger_segments_with_opening(
+        skeleton, g
+    )
+    left_mid_ee = 0.5 * (left_seg[0] + left_seg[1])
+    right_mid_ee = 0.5 * (right_seg[0] + right_seg[1])
+    # Left finger sits on +y side, its inner face points toward -y; right finger
+    # sits on -y side, its inner face points toward +y.
+    left_inner_ee = left_mid_ee - finger_radius * y_hat_ee
+    right_inner_ee = right_mid_ee + finger_radius * y_hat_ee
+    sep_inner_ee = left_inner_ee - right_inner_ee
+    sep_inner_norm = float(np.linalg.norm(sep_inner_ee))
+    if sep_inner_norm < 1e-6:
+        return None
+
+    # Demo rotation supplies the approach-direction prior.  The caller passes
+    # either the raw demo rotation or its 180° z-mirror.
+    if initial_ee_rotation_world is not None:
+        R_demo = np.asarray(initial_ee_rotation_world, dtype=np.float64).reshape(3, 3)
+    else:
+        R_demo = np.eye(3, dtype=np.float64)
+
+    # EE basis: x = approach, y = finger-separation, z = finger (base→tip).
+    finger_dir_ee = _normalize(left_seg[1] - left_seg[0])
+    x_ee = _normalize(np.cross(y_hat_ee, finger_dir_ee))
+    finger_dir_ee = _normalize(np.cross(x_ee, y_hat_ee))
+    E = np.stack([x_ee, y_hat_ee, finger_dir_ee], axis=1)
+
+    # World basis: y = contact-separation axis, x close to the demo approach.
+    y_w = sep_w / dist_w
+    demo_x_w = R_demo @ x_ee
+    x_w = demo_x_w - float(np.dot(demo_x_w, y_w)) * y_w
+    if float(np.linalg.norm(x_w)) < 1e-6:
+        # Demo approach is parallel to the separation axis; pick any perp.
+        ref = (
+            np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(y_w[0])) < 0.9
+            else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        )
+        x_w = ref - float(np.dot(ref, y_w)) * y_w
+    x_w = _normalize(x_w)
+    finger_w = _normalize(np.cross(x_w, y_w))
+    x_w = _normalize(np.cross(y_w, finger_w))
+    W = np.stack([x_w, y_w, finger_w], axis=1)
+
+    R = W @ E.T
+    # Place the left inner surface at the left contact point.
+    p = left_contact_point - R @ left_inner_ee
+
+    # Consistency check: right inner surface must land on the right contact point.
+    right_err = float(np.linalg.norm((p + R @ right_inner_ee) - right_contact_point))
+    if right_err > 1e-3:
+        return None
+
+    # --- Validate against the handle's COACD convex parts ---
+    # For a wrap grasp, only the two finger inner surfaces are intentionally
+    # constrained by the contact pair.  The palm/hand box can be behind or
+    # around the handle during the skeleton fit and is filtered later by
+    # MPPI / collision checks, so do not reject every pose whose hand box
+    # overlaps a handle convex part here.
+    has_object_eqs = (
+        object_convex_equations is not None
+        and np.asarray(object_convex_equations).size > 0
+    )
+    if has_object_eqs:
+        object_eqs = np.asarray(object_convex_equations, dtype=np.float64)
+        if object_eqs.ndim == 2:
+            object_eqs = object_eqs[None, :, :]
+        if object_convex_equation_mask is not None:
+            mask = np.asarray(object_convex_equation_mask, dtype=bool).reshape(-1)
+            if mask.size == object_eqs.shape[0]:
+                object_eqs = object_eqs[mask]
+                has_object_eqs = object_eqs.shape[0] > 0
+        if has_object_eqs:
+            seg_samples_n = int(getattr(args, "autogen_skeleton_segment_samples", 5))
+            alphas = np.linspace(0.0, 1.0, max(int(seg_samples_n), 2), dtype=np.float64)
+            left_samples_ee = (
+                left_seg[0][None, :] * (1 - alphas[:, None])
+                + left_seg[1][None, :] * alphas[:, None]
+            )
+            right_samples_ee = (
+                right_seg[0][None, :] * (1 - alphas[:, None])
+                + right_seg[1][None, :] * alphas[:, None]
+            )
+            all_samples_ee = np.concatenate([left_samples_ee, right_samples_ee], axis=0)
+            all_sample_radii = np.concatenate(
+                [
+                    np.full(left_samples_ee.shape[0], finger_radius, dtype=np.float64),
+                    np.full(right_samples_ee.shape[0], finger_radius, dtype=np.float64),
+                ],
+                axis=0,
+            )
+            samples_w = (R @ all_samples_ee.T).T + p[None, :]
+            signed = _signed_distance_to_convex(samples_w, object_eqs)
+            clearance = signed - all_sample_radii
+            if clearance.size and float(clearance.min()) < -penetration_tol:
+                return None
+
+    return SkeletonPose(
+        ee_position=np.asarray(p, dtype=np.float64),
+        ee_rotation=np.asarray(R, dtype=np.float64),
+        contact_finger="left",
+        contact_point_world=np.asarray(left_contact_point, dtype=np.float64),
+        contact_normal_world=np.asarray(left_contact_normal, dtype=np.float64),
+        qp_cost=0.0,
+        lift=0.0,
+        theta=0.0,
+        gripper_opening=float(g),
+        contact_primitive="dual_finger_inner",
+    )
+
+
 def skeleton_pose_to_ee_pose(skeleton: EESkeleton, skeleton_pose: SkeletonPose):
     """Skeleton is parameterized in the EE-site frame, so this is identity."""
     return (
@@ -1445,8 +1677,7 @@ def visualize_skeleton_poses(env, ee_site_name: str, skeleton: EESkeleton, poses
             show_right_ui=False,
         ) as viewer:
             try:
-                viewer.opt.geomgroup[:] = 0
-                viewer.opt.geomgroup[1] = 1
+                viewer.opt.geomgroup[:] = 1
                 viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
                 viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
             except Exception:
@@ -1539,8 +1770,7 @@ def visualize_skeleton_and_ee(env, ee_site_name: str, skeleton: EESkeleton, args
             show_right_ui=False,
         ) as viewer:
             try:
-                viewer.opt.geomgroup[:] = 0
-                viewer.opt.geomgroup[1] = 1
+                viewer.opt.geomgroup[:] = 1
                 viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
                 viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
             except Exception:
