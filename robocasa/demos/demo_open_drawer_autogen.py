@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions_gcc11")
@@ -73,10 +74,34 @@ def _autogen_print(message):
     print(message, file=sys.__stdout__, flush=True)
 
 
+_ANSI_YELLOW = "\033[33m"
+_ANSI_RESET = "\033[0m"
+
+
+def _autogen_print_yellow(message):
+    print(f"{_ANSI_YELLOW}{message}{_ANSI_RESET}", file=sys.__stdout__, flush=True)
+
+
+import threading as _threading
+
+_DUAL_DAQP_STATS_LOCK = _threading.Lock()
+
+
+def _record_dual_daqp_stats(args, record: dict) -> None:
+    """Append one DAQP-call stats record to args._dual_daqp_stats (thread-safe)."""
+    lst = getattr(args, "_dual_daqp_stats", None)
+    if lst is None:
+        lst = []
+        setattr(args, "_dual_daqp_stats", lst)
+    with _DUAL_DAQP_STATS_LOCK:
+        lst.append(record)
+
+
 with contextlib.redirect_stdout(open(os.devnull, "w")), contextlib.redirect_stderr(
     open(os.devnull, "w")
 ):
     import robocasa.demos.demo_close_drawer_contact_curobo as close_demo
+    from robocasa.demos import mink_q
     import robocasa.demos.mink_solver as mink_solver
 
 
@@ -699,6 +724,234 @@ def _visualize_mink_q_poses_popup(env, q_waypoints, robot_state, args, drawer_q=
             time.sleep(1.0 / fps)
 
 
+def _visualize_grasp_precontact_popup(
+    env,
+    arm_joint_names,
+    q_arm,
+    gripper_opening,
+    drawer_q,
+    target_pos,
+    target_rot,
+    args,
+):
+    """Launch a passive MuJoCo viewer showing the accepted pre-grasp arm-q
+    and gripper opening. Restores env state on close. Skipped when
+    ``autogen_visualize_grasp_precontact`` is False."""
+    if not bool(getattr(args, "autogen_visualize_grasp_precontact", True)):
+        return
+    try:
+        import mujoco
+        import mujoco.viewer
+    except Exception as exc:
+        _autogen_print(f"[grasp] precontact popup import failed: {exc!r}")
+        return
+
+    raw_model = getattr(env.sim.model, "_model", env.sim.model)
+    raw_data = getattr(env.sim.data, "_data", env.sim.data)
+    qpos_saved = env.sim.data.qpos.copy()
+    qvel_saved = env.sim.data.qvel.copy()
+
+    def _set_finger_qpos(opening):
+        for joint_name in (
+            "gripper0_right_finger_joint1",
+            "gripper0_right_finger_joint2",
+        ):
+            if joint_name in env.sim.model._joint_name2id:
+                jid = env.sim.model.joint_name2id(joint_name)
+                addr = int(env.sim.model.jnt_qposadr[jid])
+                env.sim.data.qpos[addr] = 0.5 * float(opening)
+
+    try:
+        close_demo._set_env_arm_q(env, tuple(arm_joint_names), np.asarray(q_arm))
+        close_demo._set_drawer_joint_value(env, float(drawer_q))
+        _set_finger_qpos(gripper_opening)
+        env.sim.forward()
+
+        lookat = np.asarray(target_pos, dtype=np.float64).reshape(3)
+        with mujoco.viewer.launch_passive(
+            raw_model,
+            raw_data,
+            show_left_ui=False,
+            show_right_ui=False,
+        ) as viewer:
+            try:
+                viewer.opt.geomgroup[:] = 0
+                viewer.opt.geomgroup[1] = 1
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
+            except Exception:
+                pass
+            viewer.cam.type = 0
+            viewer.cam.fixedcamid = -1
+            viewer.cam.lookat[:] = lookat
+            viewer.cam.distance = float(
+                getattr(args, "autogen_mink_popup_camera_distance", 0.85)
+            )
+            viewer.cam.azimuth = float(
+                getattr(args, "autogen_mink_popup_camera_azimuth", 135.0)
+            )
+            viewer.cam.elevation = float(
+                getattr(args, "autogen_mink_popup_camera_elevation", -25.0)
+            )
+            fps = max(float(getattr(args, "autogen_mink_popup_fps", 30.0)), 1.0)
+            while viewer.is_running():
+                viewer.sync()
+                time.sleep(1.0 / fps)
+    finally:
+        env.sim.data.qpos[:] = qpos_saved
+        env.sim.data.qvel[:] = qvel_saved
+        env.sim.forward()
+
+
+def _visualize_grasp_precontact_ghosts_popup(
+    env,
+    arm_joint_names,
+    candidates,
+    drawer_q,
+    target_pos,
+    args,
+):
+    """Ghost popup: renders hand+finger ghosts at every accepted pregrasp
+    (q_arm, gripper_opening) candidate. Accepted candidate is highlighted
+    (green, opaque); others colored by rollout score (yellow=high, red=low).
+
+    ``candidates``: list of tuples (q_arm_np(7), gripper_opening, rollout_score,
+    is_accepted).
+    """
+    if not bool(getattr(args, "autogen_visualize_grasp_precontact", True)):
+        return
+    if not candidates:
+        return
+    try:
+        import mujoco
+        import mujoco.viewer
+        from robocasa.demos import visualize_mujoco as viz_mj
+    except Exception as exc:
+        _autogen_print(f"[grasp] ghost popup import failed: {exc!r}")
+        return
+
+    frame_name = str(
+        getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+    ).split(":")[0]
+    if frame_name not in env.sim.model._site_name2id:
+        _autogen_print(f"[grasp] ghost popup: site {frame_name!r} not found")
+        return
+
+    max_ghosts = int(getattr(args, "autogen_visualize_grasp_ghost_max", 30))
+    if len(candidates) > max_ghosts:
+        # Keep the accepted one plus top (max-1) by score.
+        accepted = [c for c in candidates if c[3]]
+        others = sorted(
+            (c for c in candidates if not c[3]),
+            key=lambda c: -c[2],
+        )[: max(0, max_ghosts - len(accepted))]
+        candidates = accepted + others
+
+    raw_model = getattr(env.sim.model, "_model", env.sim.model)
+    raw_data = getattr(env.sim.data, "_data", env.sim.data)
+    qpos_saved = env.sim.data.qpos.copy()
+    qvel_saved = env.sim.data.qvel.copy()
+    site_id = int(env.sim.model.site_name2id(frame_name))
+
+    def _set_finger_qpos(opening):
+        for joint_name in (
+            "gripper0_right_finger_joint1",
+            "gripper0_right_finger_joint2",
+        ):
+            if joint_name in env.sim.model._joint_name2id:
+                jid = env.sim.model.joint_name2id(joint_name)
+                addr = int(env.sim.model.jnt_qposadr[jid])
+                env.sim.data.qpos[addr] = 0.5 * float(opening)
+
+    # Sample the EE pose (site) at each candidate's arm+gripper config.
+    ghost_poses = []  # list of (pos, rot, opening, score, is_accepted)
+    try:
+        close_demo._set_drawer_joint_value(env, float(drawer_q))
+        ghost_geoms = viz_mj._extract_hand_finger_ghost_geoms(env, frame_name)
+        for q_arm, g_open, score, accepted in candidates:
+            close_demo._set_env_arm_q(env, tuple(arm_joint_names), np.asarray(q_arm))
+            close_demo._set_drawer_joint_value(env, float(drawer_q))
+            _set_finger_qpos(g_open)
+            env.sim.forward()
+            ghost_poses.append(
+                (
+                    np.asarray(
+                        env.sim.data.site_xpos[site_id], dtype=np.float64
+                    ).copy(),
+                    np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64)
+                    .reshape(3, 3)
+                    .copy(),
+                    float(g_open),
+                    float(score),
+                    bool(accepted),
+                )
+            )
+    finally:
+        env.sim.data.qpos[:] = qpos_saved
+        env.sim.data.qvel[:] = qvel_saved
+        env.sim.forward()
+
+    if not ghost_poses:
+        return
+
+    # Color palette: accepted = green opaque; others = red→yellow by score.
+    scores = np.asarray([p[3] for p in ghost_poses], dtype=np.float64)
+    smin, smax = float(scores.min()), float(scores.max())
+    span = max(smax - smin, 1e-6)
+    alpha = float(getattr(args, "autogen_mink_ghost_alpha", 0.32))
+
+    def _color(score, accepted):
+        if accepted:
+            return np.array([0.1, 1.0, 0.2, 0.95], dtype=np.float32)
+        t = float((score - smin) / span)  # 0=worst, 1=best
+        # red (1,0.1,0.1) -> yellow (1,1,0.2)
+        return np.array([1.0, 0.1 + 0.9 * t, 0.1 + 0.1 * t, alpha], dtype=np.float32)
+
+    lookat = np.mean(np.asarray([p[0] for p in ghost_poses], dtype=np.float64), axis=0)
+    if target_pos is not None:
+        lookat = 0.5 * (lookat + np.asarray(target_pos, dtype=np.float64).reshape(3))
+
+    with mujoco.viewer.launch_passive(
+        raw_model,
+        raw_data,
+        show_left_ui=False,
+        show_right_ui=False,
+    ) as viewer:
+        try:
+            viewer.opt.geomgroup[:] = 0
+            viewer.opt.geomgroup[1] = 1
+            viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
+            viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
+        except Exception:
+            pass
+        viewer.cam.type = 0
+        viewer.cam.fixedcamid = -1
+        viewer.cam.lookat[:] = lookat
+        viewer.cam.distance = float(
+            getattr(args, "autogen_mink_popup_camera_distance", 0.85)
+        )
+        viewer.cam.azimuth = float(
+            getattr(args, "autogen_mink_popup_camera_azimuth", 135.0)
+        )
+        viewer.cam.elevation = float(
+            getattr(args, "autogen_mink_popup_camera_elevation", -25.0)
+        )
+        fps = max(float(getattr(args, "autogen_mink_popup_fps", 30.0)), 1.0)
+        _autogen_print(
+            f"[grasp] ghost popup: {len(ghost_poses)} candidates "
+            f"(accepted highlighted green, score range [{smin:+.3f}, {smax:+.3f}])"
+        )
+        while viewer.is_running():
+            if hasattr(viewer, "user_scn"):
+                viewer.user_scn.ngeom = 0
+                for pos, rot, _open, score, accepted in ghost_poses:
+                    rgba = _color(score, accepted)
+                    for ghost in ghost_geoms:
+                        viz_mj._add_ghost_geom(viewer.user_scn, ghost, pos, rot, rgba)
+            viewer.sync()
+            time.sleep(1.0 / fps)
+
+
 def _solve_stage_autogen(env, surface, pull_distance, args, stage_name):
     # Grasp mode: disable the pull stage (we close the gripper instead).
     _pull_backup = getattr(args, "execute_pull_stage", True)
@@ -1190,9 +1443,28 @@ def _solve_dual_finger_skeleton_daqp(
     motion_bound = float(getattr(args, "autogen_skeleton_motion_bound", 0.05))
     rot_bound = float(getattr(args, "autogen_skeleton_rot_bound", 0.35))
     margin = float(getattr(args, "autogen_skeleton_margin", 0.002))
+    # Finger vs. handle rows in the QP use a looser margin (default 0.0 =
+    # "no positive clearance required") so the QP can produce wrap-around
+    # solutions that graze the handle. Hand-box corners keep the strict
+    # `margin` above. The post-validation clearance check below uses the
+    # separate `penetration_tol_dual` which defaults to 5× the single-
+    # contact penetration tolerance for the same reason.
+    margin_finger_dual = float(getattr(args, "autogen_dual_object_margin", 0.0))
     clearance_tol = float(getattr(args, "autogen_skeleton_clearance_tolerance", 0.001))
     penetration_tol = float(
         getattr(args, "autogen_skeleton_object_penetration_tol", 0.001)
+    )
+    # Relaxed penetration tolerance used only in the DUAL-finger wrap-grasp
+    # post-validation. When the QP places two fingers on the two selected
+    # contact points, linearization near a curved handle often leaves finger
+    # samples a few mm inside the COACD convex parts; the strict 0.001 m
+    # tolerance rejects those poses even when they are physically plausible.
+    penetration_tol_dual = float(
+        getattr(
+            args,
+            "autogen_dual_object_penetration_tol",
+            max(penetration_tol, 0.005),
+        )
     )
     seg_samples = int(getattr(args, "autogen_skeleton_segment_samples", 5))
     theta_count = int(getattr(args, "autogen_dual_theta_count", 6))
@@ -1212,6 +1484,18 @@ def _solve_dual_finger_skeleton_daqp(
     dbg_clear_min = float("inf")
     dbg_scene_rows = 0
     dbg_scene_fail = 0
+    # Diagnostic accumulators: track WHY the QP is infeasible.
+    dbg_status_hist: dict[int, int] = {}  # DAQP exitflag histogram
+    dbg_eq_viol_min = float("inf")  # min over iters of max |A_eq x - b_eq| at x=0
+    dbg_scene_rows_min = 0  # min scene rows per (theta, lift, g)
+    dbg_scene_rows_max = 0
+    # Per-iteration LS diagnostics (captured on first iteration).
+    dbg_x_ls = np.zeros(9, dtype=np.float64)
+    dbg_resid_ls = float("inf")
+    dbg_rank_eq = 0
+    dbg_ls_in_bounds = False
+    dbg_ls_bound_viol = float("inf")
+    dbg_eq_cond = float("inf")
 
     if raw_model_data is not None:
         raw_model, raw_data = raw_model_data
@@ -1219,6 +1503,13 @@ def _solve_dual_finger_skeleton_daqp(
         raw_model = getattr(env.sim.model, "_model", env.sim.model)
         raw_data = getattr(env.sim.data, "_data", env.sim.data)
     scene_geom_ids_set = set(int(gid) for gid in (scene_geom_ids or ()))
+
+    # NOTE: the scene pool is reset ONCE by the caller before dispatching
+    # `_solve_dual_finger_skeleton_daqp` across a ThreadPoolExecutor. Do NOT
+    # call `scene_pool_local.reset()` here — it invokes `mj_copyData` on the
+    # shared per-worker `MjData` buffers, and concurrent calls from multiple
+    # threads corrupt those buffers and segfault (observed as "skeleton_scene
+    # _pool=on workers=8" followed by a bare segfault).
 
     left_contact_point = np.asarray(left_contact_point, dtype=np.float64).reshape(3)
     right_contact_point = np.asarray(right_contact_point, dtype=np.float64).reshape(3)
@@ -1455,27 +1746,40 @@ def _solve_dual_finger_skeleton_daqp(
                 H += 1e-6 * np.eye(9)
 
                 # --- Inequality constraints g: COACD clearance ---
-                # For each sample point, the linearized signed distance to the
-                # most-penetrating convex part must be >= margin + radius.
+                # Only constrain samples that start OUTSIDE the hull (sd0 > 0):
+                # a linearized half-space keeps them from driving inward past
+                # `margin + radius`.  Samples that start INSIDE (sd0 < 0) are
+                # intentionally skipped — a wrap grasp legitimately has the
+                # non-contact hand/finger samples *inside* the handle's convex
+                # hull, and pushing the QP to push them all the way out to
+                # `margin+radius` left the solver infeasible (see issue: 0
+                # skeleton_poses across all thetas).  The post-QP validation
+                # below (lines ~1650+) still rejects any solution whose final
+                # clearance is worse than `margin - penetration_tol`, so bad
+                # wrap poses are filtered without destroying feasibility.
                 rows_A = []
                 rows_b = []
                 if has_object_eqs:
                     for si in range(n_samples):
                         sample_ee = all_samples_ee[si]
                         sample_w0 = p0_lift + R0 @ sample_ee
-                        # Add a linearized clearance half-space for EVERY convex
-                        # part whose current signed distance is below the
-                        # margin+radius threshold (not just the single most
-                        # penetrating one — other parts can go into penetration
-                        # after the step).
                         pts_h = np.concatenate([sample_w0, [1.0]])  # (4,)
                         plane_vals = np.einsum("phk,k->ph", object_eqs, pts_h)  # (P, H)
                         inside_depth = plane_vals.max(axis=1)  # (P,)
+                        # Only the convex parts whose current signed distance
+                        # is in (0, threshold): they are outside but not yet
+                        # `margin + radius` clear, so the step must not push
+                        # them deeper into the part.
                         threshold = margin + all_sample_radii[si] - 1e-9
                         J_s = None
                         for part_idx in range(object_eqs.shape[0]):
                             sd0 = float(inside_depth[part_idx])
-                            if sd0 >= threshold:
+                            # sd0 > 0 means sample is currently OUTSIDE this
+                            # convex part.  sd0 < 0 means it is inside — skip
+                            # the constraint (wrap-legitimate), defer to the
+                            # post-validation clearance check.  sd0 >=
+                            # threshold means already sufficiently clear.
+                            if sd0 <= 0.0 or sd0 >= threshold:
                                 continue
                             plane_idx = int(np.argmax(plane_vals[part_idx]))
                             n_plane = object_eqs[part_idx, plane_idx, :3]
@@ -1489,15 +1793,33 @@ def _solve_dual_finger_skeleton_daqp(
                                 elif si < n_left + n_right:
                                     J_s[:, 8] = segdir_per_sample[si]
                             lhs = n_plane @ J_s
-                            rhs = margin + all_sample_radii[si] - sd0
+                            # Finger sample rows use the relaxed margin;
+                            # hand-box corner rows keep the strict `margin`.
+                            row_margin = (
+                                margin_finger_dual if si < n_left + n_right else margin
+                            )
+                            rhs = row_margin + all_sample_radii[si] - sd0
                             rows_A.append(lhs)
                             rows_b.append(rhs)
 
                 if scene_geom_ids_set:
                     # MuJoCo ray scene clearance, matching the single-contact
-                    # ee_skelton convention: cast from each skeleton sample
-                    # toward nearby scene geometry; the convex row constrains
-                    # motion along the opposite clearance direction.
+                    # ee_skelton convention: cast from each *non-finger* skeleton
+                    # sample toward nearby scene geometry; the half-space
+                    # constrains motion along the opposite clearance direction.
+                    #
+                    # IMPORTANT: finger samples (indices < n_left + n_right)
+                    # are intentionally SKIPPED here.  In a dual-finger wrap
+                    # grasp the non-contacting finger legitimately sits near
+                    # the handle body / the other finger; mj_ray from those
+                    # sample origins almost always returns a short hit, and
+                    # translating those hits into half-space rows gives DAQP
+                    # 100+ inequality constraints that are mutually
+                    # inconsistent with the 6 contact equalities — the solver
+                    # returns exitflag -1 without ever reaching status 1.
+                    # Post-validation (lines ~1726+) re-runs the same mj_ray
+                    # test and rejects truly colliding solutions, so skipping
+                    # fingers in-QP is safe.
                     ray_dirs = []
                     for d in (
                         left_contact_normal,
@@ -1514,17 +1836,16 @@ def _solve_dual_finger_skeleton_daqp(
                             ray_dirs.append(dn)
                     geomgroup = np.ones(6, dtype=np.uint8)
                     geomid_scratch = np.zeros(1, dtype=np.int32)
-                    for si in range(n_samples):
+                    n_finger_samples = n_left + n_right
+                    for si in range(n_finger_samples, n_samples):
                         sample_ee = all_samples_ee[si]
                         sample_w0 = p0_lift + R0 @ sample_ee
                         J_s = np.zeros((3, 9), dtype=np.float64)
                         J_s[:, 0:3] = np.eye(3)
                         J_s[:, 3:6] = -_skew(R0 @ sample_ee)
                         J_s[:, 6] = spread_per_sample[si]
-                        if si < n_left:
-                            J_s[:, 7] = segdir_per_sample[si]
-                        elif si < n_left + n_right:
-                            J_s[:, 8] = segdir_per_sample[si]
+                        # hand box corners (si >= n_finger_samples) have no
+                        # spread/segdir contribution, which is what we want.
                         for ray_dir in ray_dirs:
                             try:
                                 geomid_scratch[0] = -1
@@ -1593,6 +1914,94 @@ def _solve_dual_finger_skeleton_daqp(
                     ]
                 )
 
+                # Diagnostic: max equality residual at the unperturbed seed
+                # (x = 0).  If this is already huge, the contact targets are
+                # mutually inconsistent and NO choice of dx/omega/dg/sL/sR
+                # can satisfy them — DAQP has no hope.
+                eq_resid_0 = float(
+                    np.max(
+                        np.concatenate(
+                            [
+                                np.abs(b_left_lift),
+                                np.abs(b_right_lift),
+                            ]
+                        )
+                    )
+                )
+                if eq_resid_0 < dbg_eq_viol_min:
+                    dbg_eq_viol_min = eq_resid_0
+
+                # Diagnostic: minimum-norm least-squares solution of the
+                # equality system A_eq @ x = b_eq, and whether it satisfies
+                # the variable bounds.  If the LS solution already violates
+                # bounds, the QP is genuinely infeasible (the contact pair
+                # cannot be realized within the allowed dx/omega/dg/sL/sR
+                # range).  If the LS solution satisfies bounds but DAQP still
+                # returns -1, the issue is numerical (ill-conditioning,
+                # cycling) and we need a different solver or regularization.
+                A_eq = np.concatenate([A_contact_left, A_contact_right], axis=0)
+                b_eq = np.concatenate([b_left_lift, b_right_lift], axis=0)
+                try:
+                    x_ls, _, rank_eq, s_eq = np.linalg.lstsq(A_eq, b_eq, rcond=None)
+                    resid_ls = float(np.max(np.abs(A_eq @ x_ls - b_eq)))
+                    bounds_lower_x = np.array(
+                        [
+                            -motion_bound,
+                            -motion_bound,
+                            -motion_bound,
+                            -rot_bound,
+                            -rot_bound,
+                            -rot_bound,
+                            g_min - g_default,
+                            -0.5,
+                            -0.5,
+                        ],
+                        dtype=np.float64,
+                    )
+                    bounds_upper_x = np.array(
+                        [
+                            motion_bound,
+                            motion_bound,
+                            motion_bound,
+                            rot_bound,
+                            rot_bound,
+                            rot_bound,
+                            g_max - g_default,
+                            0.5,
+                            0.5,
+                        ],
+                        dtype=np.float64,
+                    )
+                    ls_in_bounds = bool(
+                        np.all(x_ls >= bounds_lower_x - 1e-9)
+                        and np.all(x_ls <= bounds_upper_x + 1e-9)
+                    )
+                    ls_bound_viol = float(
+                        max(
+                            np.max(bounds_lower_x - x_ls),
+                            np.max(x_ls - bounds_upper_x),
+                            0.0,
+                        )
+                    )
+                except Exception:
+                    x_ls = np.zeros(9)
+                    resid_ls = float("inf")
+                    rank_eq = 0
+                    s_eq = np.zeros(0)
+                    ls_in_bounds = False
+                    ls_bound_viol = float("inf")
+                if dbg_total == 1:
+                    dbg_x_ls = x_ls
+                    dbg_resid_ls = resid_ls
+                    dbg_rank_eq = int(rank_eq)
+                    dbg_ls_in_bounds = ls_in_bounds
+                    dbg_ls_bound_viol = ls_bound_viol
+                    dbg_eq_cond = (
+                        float(s_eq[0] / s_eq[-1])
+                        if s_eq.size > 0 and float(s_eq[-1]) > 0
+                        else float("inf")
+                    )
+
                 x, status, err, iters = _solve_qp_daqp(
                     H,
                     f_cost,
@@ -1604,8 +2013,47 @@ def _solve_dual_finger_skeleton_daqp(
                     tol=1e-6,
                 )
                 dbg_total += 1
+                dbg_status_hist[int(status)] = dbg_status_hist.get(int(status), 0) + 1
+                if dbg_total == 1 or int(status) != 1:
+                    dbg_scene_rows_min = min(
+                        dbg_scene_rows_min or dbg_scene_rows, dbg_scene_rows
+                    )
+                dbg_scene_rows_max = max(dbg_scene_rows_max, dbg_scene_rows)
+
+                # DAQP FALLBACK: when DAQP returns non-1 (typically -1 =
+                # unsolved/cycling, which the diagnostic LS check shows is a
+                # solver-side numerical issue rather than genuine
+                # infeasibility — resid ≈ 0, rank 6/6, cond ~60,
+                # ls_in_bounds=True), fall back to the minimum-norm LS
+                # solution.  The LS solution satisfies the 6 contact
+                # equalities exactly and the variable bounds by construction;
+                # post-validation below still rejects solutions that violate
+                # the COACD / scene-clearance rows DAQP failed to respect.
                 if int(status) != 1:
-                    continue
+                    if ls_in_bounds and resid_ls < 1e-6:
+                        x = x_ls.copy()
+                        if debug:
+                            _autogen_print(
+                                f"[dual_daqp iter] theta={float(theta):+.3f} "
+                                f"lift={float(lift):.4f} g_seed={float(g_seed):.4f} "
+                                f"daqp_status={int(status)} ls_fallback=1 "
+                                f"resid_ls={resid_ls:.3g} n_ineq={n_ineq} "
+                                f"scene_rows={dbg_scene_rows} reject_reason=ls_fallback"
+                            )
+                    else:
+                        if debug:
+                            _autogen_print(
+                                f"[dual_daqp iter] theta={float(theta):+.3f} "
+                                f"lift={float(lift):.4f} g_seed={float(g_seed):.4f} "
+                                f"daqp_status={int(status)} n_ineq={n_ineq} "
+                                f"scene_rows={dbg_scene_rows} "
+                                f"eq_resid@x0={eq_resid_0:.3g} "
+                                f"ls_in_bounds={ls_in_bounds} "
+                                f"ls_resid={resid_ls:.3g} "
+                                f"reject_reason=qp_infeasible"
+                            )
+                        continue
+
                 dbg_qp_ok += 1
 
                 dx = x[0:3]
@@ -1647,6 +2095,15 @@ def _solve_dual_finger_skeleton_daqp(
                     dbg_right_err_min = right_err
                 if left_err > 1e-2 or right_err > 1e-2:
                     dbg_err_fail += 1
+                    if debug:
+                        _autogen_print(
+                            f"[dual_daqp iter] theta={float(theta):+.3f} "
+                            f"lift={float(lift):.4f} g_seed={float(g_seed):.4f} "
+                            f"daqp_status={int(status)} n_ineq={n_ineq} "
+                            f"scene_rows={dbg_scene_rows} "
+                            f"left_err={left_err:.4g} right_err={right_err:.4g} "
+                            f"reject_reason=contact_err"
+                        )
                     continue
 
                 # 2) COACD clearance for finger samples AND hand box corners.
@@ -1676,10 +2133,23 @@ def _solve_dual_finger_skeleton_daqp(
                         samples_w, object_eqs
                     )
                     clearance = signed - radii_v
-                    if clearance.size and float(clearance.min()) < -penetration_tol:
+                    if (
+                        clearance.size
+                        and float(clearance.min()) < -penetration_tol_dual
+                    ):
                         if float(clearance.min()) < dbg_clear_min:
                             dbg_clear_min = float(clearance.min())
                         dbg_clear_fail += 1
+                        if debug:
+                            _autogen_print(
+                                f"[dual_daqp iter] theta={float(theta):+.3f} "
+                                f"lift={float(lift):.4f} g_seed={float(g_seed):.4f} "
+                                f"daqp_status={int(status)} n_ineq={n_ineq} "
+                                f"scene_rows={dbg_scene_rows} "
+                                f"min_clearance={float(clearance.min()):.4g} "
+                                f"tol={penetration_tol_dual:.4g} "
+                                f"reject_reason=coacd_pen"
+                            )
                         continue
                     if clearance.size and float(clearance.min()) < dbg_clear_min:
                         dbg_clear_min = float(clearance.min())
@@ -1689,15 +2159,28 @@ def _solve_dual_finger_skeleton_daqp(
                 # misses and verifies the scene pool/ray path is active.
                 if scene_geom_ids_set:
                     # (a) Enclosure test via SkeletonScenePool.check_penetration
-                    #     — catches samples that landed *inside* a scene geom,
-                    #     which mj_ray from the inside can miss on non-convex
-                    #     meshes (returns the exit distance, not a negative
-                    #     depth). Uses the pool's worker-0 data snapshot.
+                    #     — catches samples that landed *inside* a scene geom
+                    #     (drawer panel / table above the drawer), which the
+                    #     single-ray mj_ray path below cannot detect because
+                    #     mj_ray from inside a geom returns the *exit*
+                    #     distance (positive), not a negative depth.
+                    #
+                    #     Why: mj_ray on hand-box corners that already sit
+                    #     inside the drawer panel returned e.g. `dist_val ≈
+                    #     panel_thickness > margin + radius`, so the single-
+                    #     ray check silently accepted the pose. The multi-ray
+                    #     enclosure test in SkeletonScenePool.check_penetration
+                    #     (opposite-axis pair with matching geom id → signed
+                    #     distance) is the only reliable path.
                     scene_pool_local = getattr(
                         args, "autogen_skeleton_scene_pool", None
                     )
                     if scene_pool_local is not None:
-                        try:
+                        # Serialize the shared worker-0 MjData access: the
+                        # DAQP fan-out calls this from multiple threads and
+                        # `check_penetration` mutates MjData scratch inside
+                        # mj_multiRay — concurrent calls otherwise segfault.
+                        with scene_pool_local._lock:
                             (
                                 signed_scene,
                                 hit_geoms,
@@ -1707,22 +2190,17 @@ def _solve_dual_finger_skeleton_daqp(
                                 exclude_geom_ids=(),
                                 margin=margin,
                             )
-                            worst_idx = int(np.argmin(signed_scene))
-                            worst = float(signed_scene[worst_idx])
-                            if worst < -penetration_tol:
-                                dbg_scene_fail += 1
-                                if debug:
-                                    _autogen_print(
-                                        f"[grasp] dual_daqp scene-pen sample={worst_idx} "
-                                        f"depth={-worst:.4g} "
-                                        f"geom={scene_pool_local.geom_name(int(hit_geoms[worst_idx]))}"
-                                    )
-                                continue
-                        except Exception as exc:
+                        worst_idx = int(np.argmin(signed_scene))
+                        worst = float(signed_scene[worst_idx])
+                        if worst < -penetration_tol:
+                            dbg_scene_fail += 1
                             if debug:
                                 _autogen_print(
-                                    f"[grasp] dual_daqp scene-pen probe error: {exc!r}"
+                                    f"[grasp] dual_daqp scene-pen sample={worst_idx} "
+                                    f"depth={-worst:.4g} "
+                                    f"geom={scene_pool_local.geom_name(int(hit_geoms[worst_idx]))}"
                                 )
+                            continue
                     ray_dirs = []
                     for d in (
                         left_contact_normal,
@@ -1769,9 +2247,25 @@ def _solve_dual_finger_skeleton_daqp(
                             break
                     if not scene_ok:
                         dbg_scene_fail += 1
+                        if debug:
+                            _autogen_print(
+                                f"[dual_daqp iter] theta={float(theta):+.3f} "
+                                f"lift={float(lift):.4f} g_seed={float(g_seed):.4f} "
+                                f"daqp_status={int(status)} n_ineq={n_ineq} "
+                                f"scene_rows={dbg_scene_rows} "
+                                f"reject_reason=scene_pen"
+                            )
                         continue
 
                 cost = float(0.5 * x @ (H @ x) + f_cost @ x)
+                if debug:
+                    _autogen_print(
+                        f"[dual_daqp iter] theta={float(theta):+.3f} "
+                        f"lift={float(lift):.4f} g_seed={float(g_seed):.4f} "
+                        f"daqp_status={int(status)} cost={cost:.4g} "
+                        f"g_opt={float(g_opt):.4f} left_err={left_err:.3g} "
+                        f"right_err={right_err:.3g} reject_reason=ok"
+                    )
                 candidates.append(
                     (
                         cost,
@@ -1786,25 +2280,44 @@ def _solve_dual_finger_skeleton_daqp(
                 )
 
     if not candidates:
-        _autogen_print(
-            f"[grasp] dual_daqp: no feasible pose after {len(thetas)} thetas × "
-            f"{len(lifts)} lifts × {len(g_seeds)} g-seeds "
-            f"(left={left_contact_point[:2]} right={right_contact_point[:2]})"
-        )
-        _autogen_print(
-            f"[grasp] dual_daqp SUMMARY total={dbg_total} qp_ok={dbg_qp_ok} "
-            f"err_fail={dbg_err_fail} clear_fail={dbg_clear_fail} "
-            f"scene_fail={dbg_scene_fail} scene_rows={dbg_scene_rows} "
-            f"min_left_err={dbg_left_err_min:.4g} min_right_err={dbg_right_err_min:.4g} "
-            f"min_clearance={dbg_clear_min:.4g}"
+        _record_dual_daqp_stats(
+            args,
+            {
+                "total": int(dbg_total),
+                "qp_ok": int(dbg_qp_ok),
+                "err_fail": int(dbg_err_fail),
+                "clear_fail": int(dbg_clear_fail),
+                "scene_fail": int(dbg_scene_fail),
+                "scene_rows": int(dbg_scene_rows),
+                "candidates": 0,
+                "min_left_err": float(dbg_left_err_min),
+                "min_right_err": float(dbg_right_err_min),
+                "min_clearance": float(dbg_clear_min),
+                "daqp_status_hist": dict(dbg_status_hist),
+                "eq_resid_at_x0_min": float(dbg_eq_viol_min),
+                "eq_ls_resid": float(dbg_resid_ls),
+                "eq_ls_in_bounds": bool(dbg_ls_in_bounds),
+                "eq_ls_bound_viol": float(dbg_ls_bound_viol),
+                "eq_rank": int(dbg_rank_eq),
+                "eq_cond": float(dbg_eq_cond),
+            },
         )
         return [] if return_candidates else None
-    _autogen_print(
-        f"[grasp] dual_daqp SUMMARY total={dbg_total} qp_ok={dbg_qp_ok} "
-        f"err_fail={dbg_err_fail} clear_fail={dbg_clear_fail} "
-        f"scene_fail={dbg_scene_fail} scene_rows={dbg_scene_rows} "
-        f"candidates={len(candidates)} min_left_err={dbg_left_err_min:.4g} "
-        f"min_right_err={dbg_right_err_min:.4g} min_clearance={dbg_clear_min:.4g}"
+    _record_dual_daqp_stats(
+        args,
+        {
+            "total": int(dbg_total),
+            "qp_ok": int(dbg_qp_ok),
+            "err_fail": int(dbg_err_fail),
+            "clear_fail": int(dbg_clear_fail),
+            "scene_fail": int(dbg_scene_fail),
+            "scene_rows": int(dbg_scene_rows),
+            "candidates": int(len(candidates)),
+            "min_left_err": float(dbg_left_err_min),
+            "min_right_err": float(dbg_right_err_min),
+            "min_clearance": float(dbg_clear_min),
+            "daqp_status_hist": dict(dbg_status_hist),
+        },
     )
 
     if return_candidates:
@@ -1971,6 +2484,9 @@ def _solve_skeleton_grasp_all(
             tasks.append((pair_index, pair, mirror_tag, mirror_angle))
 
     skeleton_poses: list[tuple[int, ee_skelton.SkeletonPose, str]] = []
+    # Reset the DAQP stats aggregator for this run — one record per
+    # (pair, mirror) DAQP call gets appended.
+    setattr(args, "_dual_daqp_stats", [])
 
     def _one(pair_index, pair, mirror_tag, mirror_angle):
         from scipy.spatial.transform import Rotation as _R
@@ -1989,6 +2505,12 @@ def _solve_skeleton_grasp_all(
         )
         return pair_index, poses, mirror_tag
 
+    try:
+        from tqdm import tqdm as _tqdm
+    except Exception:
+        _tqdm = None
+
+    _t0 = time.perf_counter()
     parallel = bool(getattr(args, "grasp_skeleton_parallel", True))
     if parallel and len(tasks) > 1:
         max_workers = min(
@@ -2000,7 +2522,19 @@ def _solve_skeleton_grasp_all(
                 pool.submit(_one, pi, pair, mtag, mang): (pi, mtag)
                 for pi, pair, mtag, mang in tasks
             }
-            for fut in as_completed(futures):
+            iterator = as_completed(futures)
+            if _tqdm is not None:
+                iterator = _tqdm(
+                    iterator,
+                    total=len(futures),
+                    desc=f"dual_daqp (workers={max_workers})",
+                    unit="task",
+                    file=sys.__stdout__,
+                    dynamic_ncols=True,
+                    mininterval=0.2,
+                    leave=True,
+                )
+            for fut in iterator:
                 try:
                     pair_index, poses, mirror_tag = fut.result()
                 except Exception as exc:
@@ -2012,7 +2546,19 @@ def _solve_skeleton_grasp_all(
                 for sp in poses:
                     skeleton_poses.append((pair_index, sp, mirror_tag))
     else:
-        for pi, pair, mtag, mang in tasks:
+        iterator = tasks
+        if _tqdm is not None:
+            iterator = _tqdm(
+                iterator,
+                total=len(tasks),
+                desc="dual_daqp (workers=1)",
+                unit="task",
+                file=sys.__stdout__,
+                dynamic_ncols=True,
+                mininterval=0.2,
+                leave=True,
+            )
+        for pi, pair, mtag, mang in iterator:
             try:
                 pair_index, poses, mirror_tag = _one(pi, pair, mtag, mang)
             except Exception as exc:
@@ -2023,7 +2569,97 @@ def _solve_skeleton_grasp_all(
             for sp in poses:
                 skeleton_poses.append((pair_index, sp, mirror_tag))
 
+    elapsed = time.perf_counter() - _t0
+    _autogen_print_yellow(
+        f"[dual_daqp] done in {elapsed:.2f}s | feasible skeleton_poses={len(skeleton_poses)} "
+        f"| pairs={len(grasp_pairs)} tasks={len(tasks)}"
+    )
+
+    if bool(getattr(args, "autogen_dual_debug", False)) or bool(
+        getattr(args, "debug", False)
+    ):
+        _print_dual_daqp_debug_summary(args)
+
     return skeleton_poses
+
+
+def _print_dual_daqp_debug_summary(args) -> None:
+    """Aggregate all per-call DAQP stats and print a yellow one-liner summary.
+
+    Focus: WHY DAQP rejects poses — QP infeasibility, contact-target error,
+    penetration into the handle COACD parts, scene penetration.  Also lists
+    the worst penetration depth observed and the DAQP status histogram
+    (which tells us whether the QP itself is failing vs. later validation
+    stages are).
+    """
+    stats = list(getattr(args, "_dual_daqp_stats", []) or [])
+    if not stats:
+        _autogen_print_yellow(
+            "[dual_daqp DEBUG] no stats recorded — DAQP was never called."
+        )
+        return
+    tot = sum(int(s.get("total", 0)) for s in stats)
+    qp_ok = sum(int(s.get("qp_ok", 0)) for s in stats)
+    err_fail = sum(int(s.get("err_fail", 0)) for s in stats)
+    clear_fail = sum(int(s.get("clear_fail", 0)) for s in stats)
+    scene_fail = sum(int(s.get("scene_fail", 0)) for s in stats)
+    accepted = sum(int(s.get("candidates", 0)) for s in stats)
+    qp_infeasible = max(0, tot - qp_ok)
+    finite_clearances = [
+        float(s.get("min_clearance", float("inf")))
+        for s in stats
+        if np.isfinite(float(s.get("min_clearance", float("inf"))))
+    ]
+    worst_pen = -min(finite_clearances) if finite_clearances else 0.0
+    finite_left = [
+        float(s.get("min_left_err", float("inf")))
+        for s in stats
+        if np.isfinite(float(s.get("min_left_err", float("inf"))))
+    ]
+    finite_right = [
+        float(s.get("min_right_err", float("inf")))
+        for s in stats
+        if np.isfinite(float(s.get("min_right_err", float("inf"))))
+    ]
+    min_left = min(finite_left) if finite_left else float("nan")
+    min_right = min(finite_right) if finite_right else float("nan")
+    status_hist: dict[int, int] = {}
+    for s in stats:
+        for k, v in (s.get("daqp_status_hist") or {}).items():
+            status_hist[int(k)] = status_hist.get(int(k), 0) + int(v)
+    penetration_tol_dual = float(
+        getattr(args, "autogen_dual_object_penetration_tol", 0.005)
+    )
+    has_penetration = worst_pen > penetration_tol_dual
+    top_reason = max(
+        [
+            ("qp_infeasible", qp_infeasible),
+            ("contact_err", err_fail),
+            ("coacd_penetration", clear_fail),
+            ("scene_penetration", scene_fail),
+        ],
+        key=lambda kv: kv[1],
+    )[0]
+    _autogen_print_yellow(
+        f"[dual_daqp DEBUG] total_iters={tot} accepted={accepted} "
+        f"qp_infeasible={qp_infeasible} contact_err={err_fail} "
+        f"coacd_pen={clear_fail} scene_pen={scene_fail} top_reason={top_reason}"
+    )
+    _autogen_print_yellow(
+        f"[dual_daqp DEBUG] has_penetration={has_penetration} "
+        f"worst_penetration_depth={worst_pen:.4g}m "
+        f"(tol={penetration_tol_dual:.4g}m) "
+        f"min_left_err={min_left:.4g} min_right_err={min_right:.4g} "
+        f"daqp_status_hist={status_hist}"
+    )
+    # Which link penetrated? The dual-DAQP scene-pool check
+    # (SkeletonScenePool.check_penetration) already prints "geom=<name>" per
+    # violation when args.autogen_dual_debug is True, so we surface that as
+    # a hint.
+    _autogen_print_yellow(
+        "[dual_daqp DEBUG] penetrated links (if any) are logged inline as "
+        "'[grasp] dual_daqp scene-pen ... geom=<name>' lines above."
+    )
 
 
 def _solve_skeleton_grasp_with_rotation(
@@ -2080,6 +2716,521 @@ def _solve_skeleton_grasp_with_rotation(
     return list(poses) if poses else []
 
 
+def _robot_model_q_with_arm(env, robot_model, arm_joint_names, arm_q):
+    q_robot = close_demo._current_robot_model_q(env, robot_model)
+    for joint_name, value in zip(arm_joint_names, np.asarray(arm_q).reshape(-1)):
+        if close_demo._mj_has_name(robot_model, "joint", joint_name):
+            address = int(robot_model.joint(joint_name).qposadr[0])
+            q_robot[address] = float(value)
+    return q_robot
+
+
+def _skeleton_pregrasping_gripper_opening(skeleton_pose, args):
+    g_min = float(getattr(args, "autogen_skeleton_gripper_min", 0.005))
+    g_max = float(
+        getattr(
+            args, "autogen_skeleton_gripper_max", ee_skelton.PANDA_MAX_GRIPPER_OPENING
+        )
+    )
+    g_target = float(
+        getattr(
+            skeleton_pose,
+            "gripper_opening",
+            getattr(
+                args,
+                "autogen_skeleton_gripper_default",
+                ee_skelton.PANDA_DEFAULT_GRIPPER_OPENING,
+            ),
+        )
+    )
+    return float(np.clip(g_target, g_min, g_max))
+
+
+def _annotate_pregrasping_result(result, skeleton_pose, seed_arm_q, args):
+    arm_q = np.asarray(result.arm_q, dtype=np.float64).reshape(7)
+    seed_arm_q = np.asarray(seed_arm_q, dtype=np.float64).reshape(7)
+    g_target = float(
+        getattr(
+            skeleton_pose,
+            "gripper_opening",
+            ee_skelton.PANDA_DEFAULT_GRIPPER_OPENING,
+        )
+    )
+    g = _skeleton_pregrasping_gripper_opening(skeleton_pose, args)
+    g_error = abs(float(g) - float(g_target))
+    posture_error = float(np.linalg.norm(arm_q - seed_arm_q))
+    cost = (
+        float(result.position_error) * float(getattr(args, "mink_position_cost", 1.0))
+        + float(result.rotation_error)
+        * float(getattr(args, "mink_orientation_cost", 1.0))
+        + max(float(result.max_penetration), 0.0)
+        * float(getattr(args, "mink_pregrasping_penetration_cost", 1000.0))
+        + g_error * float(getattr(args, "mink_pregrasping_gripper_cost", 10.0))
+        + posture_error * float(getattr(args, "mink_pregrasping_posture_cost", 0.02))
+    )
+    return SimpleNamespace(
+        arm_q=np.asarray(result.arm_q, dtype=np.float64).copy(),
+        robot_q=np.asarray(result.robot_q, dtype=np.float64).copy(),
+        target_position_world=np.asarray(
+            result.target_position_world, dtype=np.float64
+        ).copy(),
+        target_rotation_world=np.asarray(
+            result.target_rotation_world, dtype=np.float64
+        ).copy(),
+        actual_position_world=np.asarray(
+            result.actual_position_world, dtype=np.float64
+        ).copy(),
+        actual_rotation_world=np.asarray(
+            result.actual_rotation_world, dtype=np.float64
+        ).copy(),
+        position_error=float(result.position_error),
+        rotation_error=float(result.rotation_error),
+        max_penetration=float(result.max_penetration),
+        collision_free=bool(result.collision_free),
+        collision_reason=str(result.collision_reason),
+        retreat_distance=float(result.retreat_distance),
+        attempts=tuple(result.attempts),
+        gripper_opening=float(g),
+        target_gripper_opening=float(g_target),
+        gripper_error=float(g_error),
+        control_q8=np.concatenate([arm_q, np.array([g], dtype=np.float64)]),
+        pregrasping_cost=float(cost),
+    )
+
+
+def solve_skeleton_pregrasping_q(
+    env,
+    *,
+    surface,
+    robot_state,
+    robot_model,
+    arm_joint_names,
+    frame_name,
+    skeleton_pose,
+    seed_arm_q,
+    args,
+    max_workers=None,
+):
+    """Solve one 8D pre-grasping control: 7 arm joints + gripper distance."""
+    arm_joint_names = tuple(arm_joint_names)
+    q_start = _robot_model_q_with_arm(env, robot_model, arm_joint_names, seed_arm_q)
+    q_posture = _robot_model_q_with_arm(
+        env,
+        robot_model,
+        arm_joint_names,
+        np.asarray(robot_state["q"], dtype=np.float64),
+    )
+    posture_cost = close_demo._make_mink_posture_cost(
+        robot_model, arm_joint_names, args
+    )
+
+    def _collision_checker(q_arm):
+        return _check_arm_q_collision_for_surface_base(
+            env,
+            surface,
+            arm_joint_names,
+            q_arm,
+            close_demo._drawer_joint_value(env),
+            set_arm_q=close_demo._set_env_arm_q,
+            set_drawer_joint_value=close_demo._set_drawer_joint_value,
+            allowed_ee_geom_name=None,
+            penetration_tolerance=float(args.mink_collision_penetration_tolerance),
+            collision_scope="arm",
+        )
+
+    result = mink_q.solve_skeleton_precontact_q_parallel(
+        env,
+        robot_model=robot_model,
+        arm_joint_names=arm_joint_names,
+        frame_name=frame_name,
+        skeleton_pose=skeleton_pose,
+        q_start=q_start,
+        q_posture=q_posture,
+        posture_cost=posture_cost,
+        args=args,
+        retreat_direction_world=np.asarray(
+            getattr(skeleton_pose, "contact_normal_world", np.array([1.0, 0.0, 0.0])),
+            dtype=np.float64,
+        ),
+        scene_collision_checker=_collision_checker,
+        max_workers=max_workers,
+    )
+    return _annotate_pregrasping_result(result, skeleton_pose, seed_arm_q, args)
+
+
+def solve_skeleton_pregrasping_q_batch(
+    env,
+    *,
+    surface,
+    robot_state,
+    robot_model,
+    arm_joint_names,
+    frame_name,
+    pose_entries,
+    seed_arm_q,
+    args,
+    max_workers=None,
+    progress_callback=None,
+):
+    arm_joint_names = tuple(arm_joint_names)
+    q_start = _robot_model_q_with_arm(env, robot_model, arm_joint_names, seed_arm_q)
+    q_posture = _robot_model_q_with_arm(
+        env,
+        robot_model,
+        arm_joint_names,
+        np.asarray(robot_state["q"], dtype=np.float64),
+    )
+    posture_cost = close_demo._make_mink_posture_cost(
+        robot_model, arm_joint_names, args
+    )
+
+    def _collision_checker(q_arm):
+        return _check_arm_q_collision_for_surface_base(
+            env,
+            surface,
+            arm_joint_names,
+            q_arm,
+            close_demo._drawer_joint_value(env),
+            set_arm_q=close_demo._set_env_arm_q,
+            set_drawer_joint_value=close_demo._set_drawer_joint_value,
+            allowed_ee_geom_name=None,
+            penetration_tolerance=float(args.mink_collision_penetration_tolerance),
+            collision_scope="arm",
+        )
+
+    raw_results = mink_q.solve_skeleton_precontact_q_batch(
+        env,
+        robot_model=robot_model,
+        arm_joint_names=arm_joint_names,
+        frame_name=frame_name,
+        pose_entries=pose_entries,
+        q_start=q_start,
+        q_posture=q_posture,
+        posture_cost=posture_cost,
+        args=args,
+        scene_collision_checker=_collision_checker,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
+    )
+    pose_by_index = {int(i): sp for i, sp, _normal in pose_entries}
+    return {
+        int(i): _annotate_pregrasping_result(
+            res, pose_by_index[int(i)], seed_arm_q, args
+        )
+        for i, res in raw_results.items()
+    }
+
+
+def _solve_grasp_pregrasping_mink(
+    env,
+    surface,
+    skeleton_poses,
+    robot_state,
+    demonstration_seed,
+    frame_name,
+    mesh_path,
+    obj_pos,
+    obj_quat,
+    obj_scale,
+    args,
+    started_time,
+):
+    rng = np.random.default_rng(int(args.seed) + 29003)
+    order = np.arange(len(skeleton_poses), dtype=np.int64)
+    rng.shuffle(order)
+    max_attempts = min(
+        int(getattr(args, "autogen_mink_max_attempts", len(skeleton_poses))),
+        len(skeleton_poses),
+    )
+    selected_order = order[:max_attempts]
+    robot_model = env.robots[0].robot_model.mujoco_model
+    arm_joint_names = tuple(robot_state["robocasa_joint_names"])
+    seed_arm_q = np.asarray(demonstration_seed.arm_q, dtype=np.float64).reshape(7)
+    pose_entries = []
+    for pose_index in selected_order:
+        _candidate_index, sp, _mirror_tag = skeleton_poses[int(pose_index)]
+        retreat_normal = np.asarray(
+            getattr(sp, "contact_normal_world", np.array([1.0, 0.0, 0.0])),
+            dtype=np.float64,
+        ).reshape(3)
+        pose_entries.append((int(pose_index), sp, retreat_normal))
+
+    _autogen_print(
+        f"[grasp] pregrasp mink batch poses={len(pose_entries)} "
+        f"workers={int(getattr(args, 'autogen_mink_parallel_workers', 1))} "
+        "control_dim=8"
+    )
+    try:
+        from tqdm import tqdm as _tqdm
+    except Exception:
+        _tqdm = None
+    try:
+        _mink_multipliers = mink_q._parse_multipliers(
+            getattr(args, "mink_q_retreat_distance_multipliers", None)
+        )
+        _multiplier_count = max(len(_mink_multipliers), 1)
+    except Exception:
+        _multiplier_count = 1
+    total_jobs = len(pose_entries) * _multiplier_count
+    pbar = (
+        _tqdm(
+            total=total_jobs,
+            desc=f"pregrasp mink (workers={int(getattr(args, 'autogen_mink_parallel_workers', 1))})",
+            unit="job",
+            file=sys.__stdout__,
+            dynamic_ncols=True,
+            mininterval=0.2,
+            leave=True,
+        )
+        if _tqdm is not None
+        else None
+    )
+
+    def _mink_progress(n):
+        if pbar is not None:
+            pbar.update(int(n))
+
+    try:
+        results = solve_skeleton_pregrasping_q_batch(
+            env,
+            surface=surface,
+            robot_state=robot_state,
+            robot_model=robot_model,
+            arm_joint_names=arm_joint_names,
+            frame_name=frame_name,
+            pose_entries=pose_entries,
+            seed_arm_q=seed_arm_q,
+            args=args,
+            max_workers=int(getattr(args, "autogen_mink_parallel_workers", 1)),
+            progress_callback=_mink_progress,
+        )
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+    pos_tol = float(
+        getattr(
+            args,
+            "mink_q_position_tolerance",
+            getattr(args, "mink_position_tolerance", 0.01),
+        )
+    )
+    pen_tol = float(getattr(args, "mink_collision_penetration_tolerance", 0.001))
+    grasp_accept_score = float(getattr(args, "grasp_accept_score", 0.15))
+    raw_data_local = getattr(env.sim.data, "_data", env.sim.data)
+    site_id_local = int(env.sim.model.site_name2id(frame_name))
+    qpos_outer_saved = env.sim.data.qpos.copy()
+    qvel_outer_saved = env.sim.data.qvel.copy()
+    drawer_q_now = float(close_demo._drawer_joint_value(env))
+    best = None
+    successful_precontact_q = 0
+    ranked = sorted(
+        ((pose_index, results[int(pose_index)]) for pose_index in results),
+        key=lambda item: float(getattr(item[1], "pregrasping_cost", float("inf"))),
+    )
+    pull_world_dir = _normalize(getattr(surface, "pull_world", (1.0, 0.0, 0.0)))
+
+    _grasp_rollout_cache = None
+    pregrasp_candidates = []  # list of (q_arm, g_opening, rollout_score, is_accepted)
+    for pose_index, result in ranked:
+        candidate_index, sp, _mirror_tag = skeleton_poses[int(pose_index)]
+        if not bool(result.collision_free):
+            continue
+        if float(result.position_error) > pos_tol:
+            continue
+        if float(result.max_penetration) > pen_tol:
+            continue
+        q_best = np.asarray(result.arm_q, dtype=np.float64).reshape(7)
+        g_best = float(
+            getattr(
+                result,
+                "gripper_opening",
+                _skeleton_pregrasping_gripper_opening(sp, args),
+            )
+        )
+        target_pos = np.asarray(result.target_position_world, dtype=np.float64).reshape(
+            3
+        )
+        target_rot = np.asarray(result.target_rotation_world, dtype=np.float64).reshape(
+            3, 3
+        )
+        rollout_score = float("-inf")
+        rollout_slip = float("inf")
+        try:
+            from robocasa.demos.rollout_grasp import GraspRollout, GraspRolloutConfig
+
+            if _grasp_rollout_cache is None:
+                drawer_obj = getattr(env, "drawer", None)
+                object_body_id = -1
+                if drawer_obj is not None:
+                    try:
+                        object_body_id = int(
+                            env.sim.model.body_name2id(drawer_obj.root_body_name)
+                        )
+                    except Exception:
+                        object_body_id = -1
+                _target_geom_ids_dbg = _target_geom_ids(env, surface)
+                _handle_world_dbg = (
+                    np.asarray(
+                        env.sim.data.geom_xpos[_target_geom_ids_dbg[0]],
+                        dtype=np.float64,
+                    )
+                    if _target_geom_ids_dbg
+                    else np.zeros(3)
+                )
+                _autogen_print(
+                    f"[grasp/build] obj_pos_arg={np.asarray(obj_pos)} "
+                    f"surface.center_world={np.asarray(surface.center_world)} "
+                    f"handle_geom_xpos={_handle_world_dbg} "
+                    f"target_pos={target_pos} "
+                    f"drawer_root_xpos={np.asarray(env.sim.data.body_xpos[object_body_id]) if object_body_id >= 0 else None}"
+                )
+                _grasp_rollout_cache = GraspRollout(
+                    env,
+                    object_body_id=object_body_id,
+                    ee_site_name=frame_name,
+                    config=GraspRolloutConfig(
+                        horizon_steps=int(getattr(args, "grasp_rollout_steps", 15)),
+                        gripper_closed_opening=float(
+                            getattr(args, "grasp_closed_opening", 0.005)
+                        ),
+                        drag_steps=int(getattr(args, "grasp_rollout_drag_steps", 20)),
+                        drag_distance=float(
+                            getattr(args, "grasp_rollout_drag_distance", 0.02)
+                        ),
+                    ),
+                    mesh_path=mesh_path,
+                    obj_pos=np.asarray(obj_pos, dtype=np.float64),
+                    obj_scale=(
+                        np.asarray(obj_scale, dtype=np.float64)
+                        if obj_scale is not None
+                        else np.ones(3, dtype=np.float64)
+                    ),
+                    obj_quat=np.asarray(obj_quat, dtype=np.float64),
+                )
+            rollout = _grasp_rollout_cache
+            r = rollout.run(
+                target_pos, target_rot, g_best, drag_direction=pull_world_dir
+            )
+            rollout_score = float(r.score_normalized)
+            rollout_slip = float(r.slip_distance)
+            _autogen_print(
+                f"[grasp] rollout pair={candidate_index} "
+                f"score={rollout_score:+.4f} slip={rollout_slip:.4f} "
+                f"progress={float(r.score_progress_sum):+.4g} "
+                f"late={float(r.score_late_min_bonus):+.4g} "
+                f"rebound={float(r.score_rebound):+.4g} "
+                f"pen={float(r.max_penetration):.6f}"
+            )
+        except Exception as exc:
+            _autogen_print(f"[grasp] rollout error: {exc!r}")
+
+        successful_precontact_q += 1
+        pregrasp_candidates.append(
+            (q_best.copy(), float(g_best), float(rollout_score), False)
+        )
+        if best is None or rollout_score > best[0]:
+            best = (rollout_score, result, int(candidate_index))
+        if rollout_score < grasp_accept_score:
+            continue
+
+        try:
+            env.sim.data.qpos[:] = qpos_outer_saved
+            env.sim.data.qvel[:] = qvel_outer_saved
+            close_demo._set_env_arm_q(env, arm_joint_names, q_best)
+            close_demo._set_drawer_joint_value(env, drawer_q_now)
+            env.sim.forward()
+            actual_pos = np.asarray(
+                raw_data_local.site_xpos[site_id_local], dtype=np.float64
+            ).copy()
+            actual_rot = (
+                np.asarray(raw_data_local.site_xmat[site_id_local], dtype=np.float64)
+                .reshape(3, 3)
+                .copy()
+            )
+        finally:
+            env.sim.data.qpos[:] = qpos_outer_saved
+            env.sim.data.qvel[:] = qvel_outer_saved
+            env.sim.forward()
+
+        solution = mink_solver.PreContactMinkSolution(
+            arm_q=q_best,
+            target_position_world=target_pos,
+            target_rotation_world=target_rot,
+            actual_position_world=actual_pos,
+            actual_rotation_world=actual_rot,
+            position_error=float(result.position_error),
+            rotation_error=float(result.rotation_error),
+            collision_free=True,
+            collision_reason="",
+        )
+        solution.gripper_opening = float(g_best)
+        solution.control_q8 = np.asarray(result.control_q8, dtype=np.float64).copy()
+        solution.force_closure_cost = float(-rollout_score)
+        solution.rollout_score = float(rollout_score)
+        solution.rollout_slip = float(rollout_slip)
+        _autogen_print(
+            f"[grasp] accept pregrasp_mink score={rollout_score:+.4f} "
+            f"slip={rollout_slip:.4f} "
+            f"pair={candidate_index} successful_precontact_q={successful_precontact_q} "
+            f"control_dim=8 t={time.perf_counter() - started_time:.3f}s"
+        )
+        if pregrasp_candidates:
+            _last = pregrasp_candidates[-1]
+            pregrasp_candidates[-1] = (_last[0], _last[1], _last[2], True)
+        try:
+            _visualize_grasp_precontact_ghosts_popup(
+                env,
+                arm_joint_names,
+                pregrasp_candidates,
+                float(drawer_q_now),
+                target_pos,
+                args,
+            )
+        except Exception as exc:
+            _autogen_print(f"[grasp] precontact ghost popup error: {exc!r}")
+        return solution, int(candidate_index)
+
+    _autogen_print(
+        f"[grasp] pregrasp_mink done attempts={max_attempts} "
+        f"successful_precontact_q={successful_precontact_q} "
+        f"best_score={best[0] if best is not None else float('-inf'):+.4f} "
+        f"t={time.perf_counter() - started_time:.3f}s"
+    )
+    if best is not None and not bool(getattr(args, "require_mink_precontact", True)):
+        rollout_score, result, candidate_index = best
+        solution = mink_solver.PreContactMinkSolution(
+            arm_q=np.asarray(result.arm_q, dtype=np.float64).reshape(7),
+            target_position_world=np.asarray(
+                result.target_position_world, dtype=np.float64
+            ),
+            target_rotation_world=np.asarray(
+                result.target_rotation_world, dtype=np.float64
+            ),
+            actual_position_world=np.asarray(
+                result.actual_position_world, dtype=np.float64
+            ),
+            actual_rotation_world=np.asarray(
+                result.actual_rotation_world, dtype=np.float64
+            ),
+            position_error=float(result.position_error),
+            rotation_error=float(result.rotation_error),
+            collision_free=True,
+            collision_reason="grasp_best_effort",
+        )
+        solution.gripper_opening = float(getattr(result, "gripper_opening", 0.0))
+        solution.control_q8 = np.asarray(result.control_q8, dtype=np.float64).copy()
+        solution.force_closure_cost = float(-rollout_score)
+        solution.rollout_score = float(rollout_score)
+        return solution, int(candidate_index)
+
+    raise RuntimeError(
+        "Grasp pregrasp mink found no collision-free 8D control with "
+        f"rollout score >= {grasp_accept_score}. attempts={max_attempts} "
+        f"successful_q={successful_precontact_q}"
+    )
+
+
 def _solve_grasp_precontact_autogen(
     env, surface, candidates, demonstration_seed, robot_state, args
 ):
@@ -2118,7 +3269,12 @@ def _solve_grasp_precontact_autogen(
     skeleton = ee_skelton.build_panda_skeleton(env, frame_name)
 
     # ---- 2/3. MIQP: compute feasible contact pairs on the SHARED mesh ----
-    num_pairs = int(getattr(args, "grasp_num_pairs", 200))
+    debug_mode = bool(getattr(args, "debug", False))
+    num_pairs = int(getattr(args, "grasp_num_pairs", 512))
+    min_pairs = int(getattr(args, "grasp_min_pairs", 16 if debug_mode else 256))
+    sample_budget = int(
+        getattr(args, "grasp_miqp_sample_budget", 32 if debug_mode else 120)
+    )
     mesh_path = getattr(feasible_cache, "_grasp_handle_mesh_path", None)
     if mesh_path is None:
         mesh_path = getattr(args, "_autogen_grasp_handle_mesh_path", None)
@@ -2142,7 +3298,10 @@ def _solve_grasp_precontact_autogen(
                     dtype=np.float64,
                 ),
                 num_pairs=num_pairs,
+                min_pairs=min_pairs,
+                sample_budget=sample_budget,
                 verbose=True,
+                debug=debug_mode,
             )
         except Exception as exc:
             _autogen_print(f"[grasp] MIQP failed: {exc!r}")
@@ -2223,16 +3382,64 @@ def _solve_grasp_precontact_autogen(
     )
     from collections import Counter
 
+    # Downsample: if the DAQP fleet returned more feasible poses than
+    # `autogen_grasp_max_skeleton_poses` (default 512), keep the best 512
+    # by DAQP cost (SkeletonPose.qp_cost).  Silently keeping >1000 poses
+    # made the downstream MPPI loop hang for minutes with no user feedback.
+    max_poses = int(getattr(args, "autogen_grasp_max_skeleton_poses", 512))
+    if max_poses > 0 and len(skeleton_poses) > max_poses:
+        original_count = len(skeleton_poses)
+        skeleton_poses = sorted(
+            skeleton_poses, key=lambda item: float(item[1].qp_cost)
+        )[:max_poses]
+        _autogen_print_yellow(
+            f"[dual_daqp] downsampled skeleton_poses {original_count} -> "
+            f"{len(skeleton_poses)} (autogen_grasp_max_skeleton_poses={max_poses})"
+        )
     mirror_counts = Counter(mtag for _, _, mtag in skeleton_poses)
     _autogen_print(
         f"[grasp] skeleton_poses={len(skeleton_poses)} "
         f"mirror_dist={dict(mirror_counts)}"
     )
+    # Skeleton-pose popup for the grasp path. This runs only after the DAQP
+    # tqdm has reached 100%, so the viewer shows the completed feasible set.
+    if bool(getattr(args, "autogen_visualize_grasp_skeleton_poses", False)):
+        _viz_skeleton_backup = getattr(args, "autogen_visualize_skeleton_poses", True)
+        try:
+            args.autogen_visualize_skeleton_poses = True
+            ee_skelton.visualize_skeleton_poses(
+                env,
+                frame_name,
+                skeleton,
+                [sp for _, sp, _ in skeleton_poses],
+                args,
+            )
+        except Exception as exc:
+            _autogen_print(f"[grasp] skeleton_poses popup error: {exc!r}")
+        finally:
+            args.autogen_visualize_skeleton_poses = _viz_skeleton_backup
     if not skeleton_poses:
         raise RuntimeError(
             "Grasp dual-finger DAQP skeleton solver found no collision-free "
             "pose for any contact pair. Try increasing `autogen_dual_theta_count` "
             "`autogen_dual_n_lift`, or `autogen_dual_n_g`."
+        )
+
+    grasp_solver = str(getattr(args, "grasp_precontact_solver", "mink")).lower()
+    if grasp_solver in {"mink", "auto", "pregrasp", "pregrasping"}:
+        return _solve_grasp_pregrasping_mink(
+            env,
+            surface,
+            skeleton_poses,
+            robot_state,
+            demonstration_seed,
+            frame_name,
+            mesh_path,
+            obj_pos,
+            obj_quat,
+            obj_scale,
+            args,
+            mink_started,
         )
 
     # ---- MPPI for pre-contact q + grasp rollout ----
@@ -2256,7 +3463,28 @@ def _solve_grasp_precontact_autogen(
     best_candidate_index = int(skeleton_poses[0][0]) if skeleton_poses else 0
     grasp_accept_threshold = float(getattr(args, "grasp_accept_threshold", 1.0))
 
-    for attempt_id, pose_index in enumerate(order[:max_attempts]):
+    # Progress bar for the MPPI attempt loop. Without this the pipeline
+    # appears to hang for minutes after the `skeleton_poses=...` log line
+    # while `solve_arm_q_mppi` runs silently per attempt.
+    try:
+        from tqdm import tqdm as _tqdm
+    except Exception:
+        _tqdm = None
+    _mppi_iter = enumerate(order[:max_attempts])
+    if _tqdm is not None:
+        _mppi_iter = _tqdm(
+            list(_mppi_iter),
+            total=int(max_attempts),
+            desc="grasp mppi",
+            unit="pose",
+            file=sys.__stdout__,
+            dynamic_ncols=True,
+            mininterval=0.2,
+            leave=True,
+        )
+    _mppi_t0 = time.perf_counter()
+
+    for attempt_id, pose_index in _mppi_iter:
         candidate_index, sp, mirror_tag = skeleton_poses[int(pose_index)]
         pair = grasp_pairs[int(candidate_index)]
         target_pos, target_quat = ee_skelton.skeleton_pose_to_ee_pose(skeleton, sp)
@@ -2583,6 +3811,15 @@ def parse_args():
         metavar="KEY=VALUE",
         help="Override a YAML value. May be passed multiple times.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Fast debug loop: shrink DAQP / MIQP sample counts, disable all "
+            "visualization popups, and enable per-iteration [dual_daqp iter] "
+            "logs so DAQP failure modes are grep-able."
+        ),
+    )
     cli = parser.parse_args()
     config = _load_yaml_config(cli.config)
     config["scene_cache_dir"] = str(
@@ -2622,6 +3859,7 @@ def parse_args():
         "autogen_initial_pose_count": 200,
         "autogen_precontact_lift": config.get("precontact_distance", 0.04),
         "autogen_mink_max_attempts": 200,
+        "autogen_mink_parallel_workers": max(1, (os.cpu_count() or 1)),
         "autogen_skeleton_parallel_workers": max(1, (os.cpu_count() or 1)),
         "autogen_coacd_threshold": 0.05,
         "autogen_coacd_max_convex_hull": 32,
@@ -2644,7 +3882,7 @@ def parse_args():
         "grasp_closed_opening": 0.005,
         "grasp_mppi_samples": 256,
         "grasp_mppi_iterations": 6,
-        "grasp_precontact_solver": "mppi",  # "mppi" | "mink" | "auto"
+        "grasp_precontact_solver": "mink",  # "mink" | "mppi" | "auto"
         "grasp_skeleton_parallel": True,
         "grasp_skeleton_max_workers": 8,
         # --- dual-finger DAQP skeleton solver ---
@@ -2657,10 +3895,43 @@ def parse_args():
         "autogen_dual_debug": False,
         "autogen_visualize_contact_pairs": True,
         "autogen_contact_pair_radius": 0.004,
+        # --- relaxed penetration for the dual-finger wrap-grasp path ---
+        "autogen_dual_object_penetration_tol": 0.005,
+        "autogen_dual_object_margin": 0.0,
+        # --- grasp-path skeleton pose cap + optional popup ---
+        "autogen_grasp_max_skeleton_poses": 512,
+        "autogen_visualize_grasp_skeleton_poses": True,
+        # --- debug fast-path (set by --debug) ---
+        "debug": False,
     }
     for key, value in defaults.items():
         config.setdefault(key, value)
     _apply_config_overrides(config, cli.overrides)
+    if bool(getattr(cli, "debug", False)):
+        config["debug"] = True
+        # Only stomp keys the user did NOT already override; that keeps
+        # `--set autogen_dual_theta_count=8 --debug` doing the sensible thing.
+        _debug_overrides = {
+            "autogen_dual_theta_count": 2,
+            "autogen_dual_n_lift": 1,
+            "autogen_dual_n_g": 1,
+            "autogen_dual_debug": True,
+            "autogen_skeleton_segment_samples": 2,
+            "autogen_skeleton_n_random": 1,
+            "autogen_skeleton_theta_count": 2,
+            "autogen_visualize_mink_poses": False,
+            "autogen_visualize_skeleton_poses": False,
+            "autogen_visualize_skeleton_preview": False,
+            "autogen_visualize_contact_pairs": False,
+            "autogen_visualize_grasp_skeleton_poses": False,
+            "grasp_num_pairs": 32,
+        }
+        _cli_override_keys = {
+            key.split("=", 1)[0].replace("-", "_") for key in cli.overrides
+        }
+        for key, value in _debug_overrides.items():
+            if key not in _cli_override_keys:
+                config[key] = value
     return argparse.Namespace(**config)
 
 

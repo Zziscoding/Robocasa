@@ -49,6 +49,17 @@ class GraspRolloutConfig:
     prefer_comfree: bool = True
     # Evaluate force_closure_cost at this step index (-1 = last step).
     force_closure_eval_at_step: int = -1
+    # --- drag phase (drives the closed EE along a demo direction) ----------
+    # After the close phase, the EE is translated along ``drag_direction`` by
+    # ``drag_distance`` over ``drag_steps`` sim-steps. The object position is
+    # tracked over the drag phase and turned into a rollout.py-style score so
+    # slipping grasps (object stays put) get low scores and firm grasps
+    # (object follows the EE) get high scores.
+    drag_steps: int = 20
+    drag_distance: float = 0.02
+    score_gamma: float = 0.95
+    score_late_weight: float = 5.0
+    score_rebound_weight: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -61,6 +72,17 @@ class GraspRolloutResult:
     gripper_opening_at_min: float
     max_penetration: float
     steps: int
+    # --- drag-phase score (see GraspRolloutConfig for the formula) ---------
+    # object_cost[j] = ||obj_pos[j] - obj_target||^2, where obj_target is the
+    # object position we want it to reach if it moves with the EE.
+    drag_object_costs: np.ndarray = None  # (drag_steps,) float64
+    drag_object_positions: np.ndarray = None  # (drag_steps, 3) float64
+    score: float = float("-inf")
+    score_normalized: float = float("-inf")
+    score_progress_sum: float = 0.0
+    score_late_min_bonus: float = 0.0
+    score_rebound: float = 0.0
+    slip_distance: float = float("inf")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +243,10 @@ def _build_grasp_rollout_mjcf(
     object_body_id: int,
     timestep: float,
     zero_gravity: bool = True,
+    mesh_path: Optional[str] = None,
+    obj_pos_override: Optional[np.ndarray] = None,
+    obj_quat_override: Optional[np.ndarray] = None,
+    obj_scale: Optional[np.ndarray] = None,
 ) -> str:
     """Build an MJCF with palm + 2 finger bodies + object subtree.
 
@@ -232,14 +258,27 @@ def _build_grasp_rollout_mjcf(
     object_geoms = _extract_object_geoms(env, raw_model, raw_data, object_body_id)
 
     obj = raw_model
-    obj_body_pos = np.asarray(raw_data.xpos[object_body_id], dtype=np.float64).reshape(
-        3
+    if obj_pos_override is not None:
+        obj_body_pos = np.asarray(obj_pos_override, dtype=np.float64).reshape(3)
+    else:
+        obj_body_pos = np.asarray(
+            raw_data.xpos[object_body_id], dtype=np.float64
+        ).reshape(3)
+    print(
+        f"[build_scene] obj_body_pos={obj_body_pos} "
+        f"override={'yes' if obj_pos_override is not None else 'no'} "
+        f"raw_xpos={np.asarray(raw_data.xpos[object_body_id], dtype=np.float64)}",
+        file=sys.__stdout__,
+        flush=True,
     )
-    obj_body_quat = np.zeros(4, dtype=np.float64)
-    mujoco.mju_mat2Quat(
-        obj_body_quat,
-        np.asarray(raw_data.xmat[object_body_id], dtype=np.float64).reshape(9),
-    )
+    if obj_quat_override is not None:
+        obj_body_quat = np.asarray(obj_quat_override, dtype=np.float64).reshape(4)
+    else:
+        obj_body_quat = np.zeros(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(
+            obj_body_quat,
+            np.asarray(raw_data.xmat[object_body_id], dtype=np.float64).reshape(9),
+        )
 
     def _geom_xml(size_3, pos_3, quat_wxyz, name, rgba="0.5 0.5 0.5 1"):
         return (
@@ -273,6 +312,35 @@ def _build_grasp_rollout_mjcf(
         for i, (_type, size, pos, quat) in enumerate(object_geoms)
     )
 
+    # Prefer the exported COACD handle mesh (a single, physically-valid
+    # collision body) over the extracted MuJoCo geoms — the extraction path
+    # emits any MESH-type source geom as a zero-size <geom type="box">, which
+    # gives the freejoint body zero mass and triggers the MuJoCo compile-time
+    # `mass and inertia of moving bodies must be larger than mjMINVAL` error.
+    asset_xml = ""
+    if mesh_path is not None and Path(mesh_path).exists():
+        scale_vec = (
+            np.asarray(obj_scale, dtype=np.float64).reshape(3)
+            if obj_scale is not None
+            else np.ones(3, dtype=np.float64)
+        )
+        asset_xml = (
+            "  <asset>\n"
+            f'    <mesh name="grasp_object_mesh" file="{mesh_path}" '
+            f'scale="{_fmt(scale_vec)}"/>\n'
+            "  </asset>\n"
+        )
+        obj_xml = (
+            '      <geom name="obj_mesh" type="mesh" mesh="grasp_object_mesh" '
+            'rgba="0.88 0.52 0.22 1" contype="1" conaffinity="1"/>\n'
+        )
+    # Always emit an explicit <inertial> so the freejoint body has non-zero
+    # mass even when the mesh path is unavailable or the mesh volume is
+    # degenerate (which would otherwise re-trigger the mjMINVAL error).
+    inertial_xml = (
+        '      <inertial pos="0 0 0" mass="0.1" ' 'diaginertia="1e-4 1e-4 1e-4"/>\n'
+    )
+
     gravity = "0 0 0" if zero_gravity else "0 0 -9.81"
 
     return (
@@ -281,11 +349,11 @@ def _build_grasp_rollout_mjcf(
         f'  <option timestep="{float(timestep):.9g}" gravity="{gravity}" integrator="Euler"/>\n'
         "  <default>\n"
         '    <geom condim="3" friction="1 0.05 0.005" solref="0.01 1" solimp="0.9 0.95 0.001"/>\n'
-        "  </default>\n"
-        "  <worldbody>\n"
+        "  </default>\n" + asset_xml + "  <worldbody>\n"
         f'    <body name="grasp_object" pos="{_fmt(obj_body_pos)}" '
         f'quat="{_fmt(obj_body_quat)}">\n'
         f'      <freejoint name="grasp_object_freejoint"/>\n'
+        + inertial_xml
         + obj_xml
         + "    </body>\n"
         '    <body name="palm" pos="0 0 0" quat="1 0 0 0">\n'
@@ -293,10 +361,16 @@ def _build_grasp_rollout_mjcf(
         + palm_xml
         + f'      <body name="left_finger" pos="0 {float(left_y):.6f} 0" quat="1 0 0 0">\n'
         f'        <joint name="left_finger_slide" type="slide" axis="0 1 0" '
-        f'range="-0.1 0.1" damping="0.5"/>\n' + left_xml + "      </body>\n"
+        f'range="-0.1 0.1" damping="0.5"/>\n'
+        '        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-5 1e-5 1e-5"/>\n'
+        + left_xml
+        + "      </body>\n"
         f'      <body name="right_finger" pos="0 {float(right_y):.6f} 0" quat="1 0 0 0">\n'
         f'        <joint name="right_finger_slide" type="slide" axis="0 1 0" '
-        f'range="-0.1 0.1" damping="0.5"/>\n' + right_xml + "      </body>\n"
+        f'range="-0.1 0.1" damping="0.5"/>\n'
+        '        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-5 1e-5 1e-5"/>\n'
+        + right_xml
+        + "      </body>\n"
         "    </body>\n"
         "  </worldbody>\n"
         "</mujoco>\n"
@@ -375,6 +449,10 @@ class GraspRollout:
                 object_body_id,
                 float(self.config.sim_dt),
                 zero_gravity=True,
+                mesh_path=self.mesh_path,
+                obj_pos_override=self.obj_pos,
+                obj_quat_override=self.obj_quat,
+                obj_scale=self.obj_scale,
             )
         )
         self.object_body_id = int(
@@ -419,6 +497,14 @@ class GraspRollout:
         self._palm_free_daddr = int(self.model_cpu.jnt_dofadr[palm_free])
         self._left_slide_qaddr = int(self.model_cpu.jnt_qposadr[left_slide])
         self._right_slide_qaddr = int(self.model_cpu.jnt_qposadr[right_slide])
+        obj_free = int(
+            mujoco.mj_name2id(
+                self.model_cpu, mujoco.mjtObj.mjOBJ_JOINT, "grasp_object_freejoint"
+            )
+        )
+        self._obj_free_qaddr = (
+            int(self.model_cpu.jnt_qposadr[obj_free]) if obj_free >= 0 else -1
+        )
         # Initial finger offsets (half spread).
         q0 = np.zeros(self.model_cpu.nq, dtype=np.float64)
         mujoco.mj_fwdPosition(self.model_cpu, mujoco.MjData(self.model_cpu))
@@ -553,6 +639,17 @@ class GraspRollout:
         self.data_cpu.qvel[:] = qvel
         mujoco.mj_forward(self.model_cpu, self.data_cpu)
 
+    def _read_object_position(self) -> np.ndarray:
+        xpos = _backend_tensor(self.data.xpos)
+        return (
+            xpos[0, self.object_body_id, :]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+            .reshape(3)
+        )
+
     # ----- main rollout -----------------------------------------------------
 
     def run(
@@ -560,8 +657,9 @@ class GraspRollout:
         ee_position: np.ndarray,
         ee_rotation: np.ndarray,
         initial_gripper_opening: float,
+        drag_direction: Optional[np.ndarray] = None,
     ) -> GraspRolloutResult:
-        """Close the gripper and track penetration / force-closure cost.
+        """Close the gripper, then drag along ``drag_direction`` and score.
 
         Parameters
         ----------
@@ -569,16 +667,43 @@ class GraspRollout:
         ee_rotation : (3, 3) palm world rotation.
         initial_gripper_opening : full fingertip distance at the start of
             the rollout (e.g. 0.04 m).
-
-        Returns
-        -------
-        :class:`GraspRolloutResult`
+        drag_direction : (3,) world-frame unit vector along which the closed
+            EE is translated by ``config.drag_distance`` over
+            ``config.drag_steps`` sim-steps. If ``None``, the drag phase and
+            score are skipped and the returned result has score = -inf.
         """
         cfg = self.config
         ee_position = np.asarray(ee_position, dtype=np.float64).reshape(3)
         ee_rotation = np.asarray(ee_rotation, dtype=np.float64).reshape(3, 3)
         quat_wxyz = np.zeros(4, dtype=np.float64)
         mujoco.mju_mat2Quat(quat_wxyz, ee_rotation.reshape(9))
+
+        # Reset sim state so cached rollouts don't inherit drift from prior runs.
+        # Freejoint qpos is the ABSOLUTE world pose: (x, y, z, qw, qx, qy, qz).
+        qpos_t = _backend_tensor(self.data.qpos)
+        qvel_t = _backend_tensor(self.data.qvel)
+        qvel_t[...] = 0
+        if self._obj_free_qaddr >= 0:
+            a = self._obj_free_qaddr
+            obj_pos_init = (
+                self.obj_pos
+                if self.obj_pos is not None
+                else np.zeros(3, dtype=np.float64)
+            )
+            if self.obj_quat is not None:
+                obj_quat_init = np.asarray(self.obj_quat, dtype=np.float64).reshape(4)
+            else:
+                obj_quat_init = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            qpos_t[0, a : a + 3] = torch.as_tensor(
+                obj_pos_init.astype(np.float32),
+                device=qpos_t.device,
+                dtype=qpos_t.dtype,
+            )
+            qpos_t[0, a + 3 : a + 7] = torch.as_tensor(
+                obj_quat_init.astype(np.float32),
+                device=qpos_t.device,
+                dtype=qpos_t.dtype,
+            )
 
         target_open = float(cfg.gripper_closed_opening)
         steps = int(cfg.horizon_steps)
@@ -618,12 +743,91 @@ class GraspRollout:
                 self._step_fn()
             pens[j] = self._read_penetration()
             worst_pen = max(worst_pen, pens[j])
+            if j in (0, steps // 2, steps - 1):
+                _op = self._read_object_position()
+                print(
+                    f"[rollout close j={j}] obj={_op} ee={ee_position} "
+                    f"d={float(np.linalg.norm(_op - ee_position)):.4f} pen={pens[j]:.6f}",
+                    file=sys.__stdout__,
+                    flush=True,
+                )
 
-            if j == eval_step and self.mesh_path is not None:
-                fc_costs[j] = self._eval_force_closure() or float("inf")
+            if j == eval_step and self.mesh_path is not None and drag_direction is None:
+                try:
+                    fc_costs[j] = self._eval_force_closure() or float("inf")
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[grasp_rollout] _eval_force_closure skipped: {exc!r}\n"
+                    )
+                    fc_costs[j] = float("inf")
             if np.isfinite(fc_costs[j]) and fc_costs[j] < best_fc_cost:
                 best_fc_cost = fc_costs[j]
                 best_fc_open = openings_arr[j]
+
+        drag_costs = None
+        drag_positions = None
+        score = float("-inf")
+        score_normalized = float("-inf")
+        progress_sum = 0.0
+        late_min_bonus = 0.0
+        rebound = 0.0
+        slip_distance = float("inf")
+
+        if drag_direction is not None and int(cfg.drag_steps) > 0:
+            drag_dir = np.asarray(drag_direction, dtype=np.float64).reshape(3)
+            n = float(np.linalg.norm(drag_dir))
+            if n > 1e-9:
+                drag_dir = drag_dir / n
+                n_drag = int(cfg.drag_steps)
+                drag_total = float(cfg.drag_distance)
+                step_dist = drag_total / max(1, n_drag)
+                obj0 = self._read_object_position()
+                target_obj = obj0 + drag_total * drag_dir
+                left_y_hold = left_sign * half_target
+                right_y_hold = right_sign * half_target
+
+                drag_costs = np.zeros(n_drag, dtype=np.float64)
+                drag_positions = np.zeros((n_drag, 3), dtype=np.float64)
+
+                def _cost(pos):
+                    d = np.asarray(pos, dtype=np.float64).reshape(3) - target_obj
+                    return float(d.dot(d))
+
+                for k in range(n_drag):
+                    pos_k = ee_position + (k + 1) * step_dist * drag_dir
+                    self._write_mocap_and_fingers(
+                        pos_k, quat_wxyz, left_y_hold, right_y_hold
+                    )
+                    self._step_fn()
+                    obj_pos = self._read_object_position()
+                    drag_positions[k] = obj_pos
+                    drag_costs[k] = _cost(obj_pos)
+                    print(
+                        f"[rollout drag k={k}] obj={obj_pos} target={target_obj} "
+                        f"ee={pos_k} d={float(np.sqrt(drag_costs[k])):.4f}",
+                        file=sys.__stdout__,
+                        flush=True,
+                    )
+
+                step0 = float(_cost(obj0))
+                progress = step0 - drag_costs
+                discount = float(cfg.score_gamma) ** np.arange(n_drag, dtype=np.float64)
+                progress_sum = float(np.dot(discount, progress))
+                half = max(n_drag // 2, 1)
+                late_min = float(np.min(drag_costs[half:]))
+                late_min_bonus = step0 - late_min
+                rebound = max(0.0, float(drag_costs[-1]) - late_min)
+                score = (
+                    progress_sum
+                    + float(cfg.score_late_weight) * late_min_bonus
+                    - float(cfg.score_rebound_weight) * rebound
+                )
+                denom = max(step0 * float(n_drag), 1e-12)
+                score_normalized = float(score / denom)
+                # Slip = shortfall between EE displacement and object
+                # displacement. Zero-slip grasp: object moves with the EE.
+                obj_travel = float(np.linalg.norm(drag_positions[-1] - obj0))
+                slip_distance = max(0.0, drag_total - obj_travel)
 
         return GraspRolloutResult(
             force_closure_costs=fc_costs,
@@ -636,6 +840,14 @@ class GraspRollout:
             gripper_opening_at_min=best_fc_open,
             max_penetration=worst_pen,
             steps=steps,
+            drag_object_costs=drag_costs,
+            drag_object_positions=drag_positions,
+            score=float(score),
+            score_normalized=float(score_normalized),
+            score_progress_sum=float(progress_sum),
+            score_late_min_bonus=float(late_min_bonus),
+            score_rebound=float(rebound),
+            slip_distance=float(slip_distance),
         )
 
     def _eval_force_closure(self) -> Optional[float]:

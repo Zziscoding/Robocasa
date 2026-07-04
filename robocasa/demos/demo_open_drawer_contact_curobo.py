@@ -102,7 +102,7 @@ with contextlib.redirect_stdout(_QUIET_IMPORT_SINK), contextlib.redirect_stderr(
     import robocasa  # noqa: F401
     import robocasa.utils.lerobot_utils as LU
     import robocasa.demos.demo_close_drawer_contact_curobo as close_demo
-    import robocasa.demos.mink_solver as mink_solver
+    import robocasa.demos.mink_q as mink_q
     from robocasa.demos.demo_tasks import get_ds_path_any_split
     from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 
@@ -884,7 +884,7 @@ def _solve_mink_precontact_seed(
         precontact_position = projected_ee_position + retreat * (
             float(args.precontact_distance) * float(multiplier)
         )
-        candidate_solution = mink_solver.solve_precontact_pose(
+        candidate_solution = mink_q.solve_precontact_pose(
             env,
             panel,
             robot_state,
@@ -972,7 +972,7 @@ def _solve_stage(env, surface, pull_distance, args, stage_name):
         demonstration_seed = _load_and_project_demonstration_seed(env, args)
     args._demonstration_seed = demonstration_seed
     robot_state = close_demo.get_robot_arm_state(env)
-    base_alignment = mink_solver.align_base_to_demo_ee_pose(
+    base_alignment = mink_q.align_base_to_demo_ee_pose(
         env,
         demonstration_seed,
         robot_state,

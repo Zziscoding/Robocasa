@@ -98,12 +98,13 @@ class SkeletonScenePool:
         exclude_geom_ids=(),
         margin: float = 0.0,
     ):
-        """Per-sample signed-distance / penetration check via ``mj_ray``.
+        """Per-sample signed-distance / penetration check via ``mj_multiRay``.
 
         For every sample (a sphere of ``radii[i]``) we cast six axis-aligned
-        rays outward. If two opposite rays both hit the *same* scene geom
-        (not in ``exclude_geom_ids``) with total travel <
-        ``2 * (radius + margin)`` the sample sits inside that geom.
+        rays outward in a single ``mj_multiRay`` call (falls back to
+        per-axis ``mj_ray`` if unavailable). If two opposite rays both hit
+        the *same* scene geom (not in ``exclude_geom_ids``) with total
+        travel < ``2 * (radius + margin)`` the sample sits inside that geom.
 
         Returns ``(signed_distance, hit_geom_id)`` with one entry per sample.
         ``signed_distance`` is negative on penetration (``-half_overlap``) and
@@ -115,48 +116,72 @@ class SkeletonScenePool:
             np.asarray(samples_w, dtype=np.float64).reshape(-1, 3)
         )
         radii = np.asarray(radii, dtype=np.float64).reshape(-1)
-        if radii.size != samples.shape[0]:
+        n_samples = samples.shape[0]
+        if radii.size != n_samples:
             raise ValueError("radii size must match samples")
         exclude = set(int(g) for g in (exclude_geom_ids or ()))
         model = self.model
         data = self._datas[0]
         geomgroup = np.ones(6, dtype=np.uint8)
-        gid_scratch = np.zeros(1, dtype=np.int32)
         n_geoms = int(model.ngeom)
-        signed = np.full(samples.shape[0], np.inf, dtype=np.float64)
-        hit_geom = np.full(samples.shape[0], -1, dtype=np.int64)
+        signed = np.full(n_samples, np.inf, dtype=np.float64)
+        hit_geom = np.full(n_samples, -1, dtype=np.int64)
+        if n_samples == 0:
+            return signed, hit_geom
         axes = np.array(
             [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
             dtype=np.float64,
         )
-        for si in range(samples.shape[0]):
+        axes_c = np.ascontiguousarray(axes)  # 6 x 3
+        cutoff = float(np.max(radii) + max(margin, 0.0)) * 4.0 + 1e-3
+        gid_buf = np.full(6, -1, dtype=np.int32)
+        dist_buf = np.full(6, -1.0, dtype=np.float64)
+        multiray = getattr(mujoco, "mj_multiRay", None)
+        for si in range(n_samples):
             origin = np.ascontiguousarray(samples[si])
-            per_axis_hit = {}
-            for ai in range(6):
-                gid_scratch[0] = -1
-                try:
-                    dist_val = mujoco.mj_ray(
+            gid_buf[:] = -1
+            dist_buf[:] = -1.0
+            try:
+                if multiray is not None:
+                    multiray(
                         model,
                         data,
                         origin,
-                        np.ascontiguousarray(axes[ai]),
+                        axes_c.reshape(-1),
                         geomgroup,
                         1,
                         -1,
-                        gid_scratch,
+                        gid_buf,
+                        dist_buf,
+                        6,
+                        cutoff,
                     )
-                except Exception:
-                    dist_val = -1.0
-                    gid_scratch[0] = -1
-                gid = int(gid_scratch[0])
-                if (
-                    float(dist_val) > 0.0
-                    and gid >= 0
-                    and gid < n_geoms
-                    and gid not in exclude
-                ):
-                    per_axis_hit[ai] = (float(dist_val), gid)
-            # Pair opposite rays: (+x,-x) (+y,-y) (+z,-z) -> (0,1) (2,3) (4,5)
+                else:
+                    for ai in range(6):
+                        gscratch = np.zeros(1, dtype=np.int32)
+                        d_val = mujoco.mj_ray(
+                            model,
+                            data,
+                            origin,
+                            np.ascontiguousarray(axes[ai]),
+                            geomgroup,
+                            1,
+                            -1,
+                            gscratch,
+                        )
+                        dist_buf[ai] = float(d_val)
+                        gid_buf[ai] = int(gscratch[0])
+            except Exception:
+                gid_buf[:] = -1
+                dist_buf[:] = -1.0
+
+            per_axis_hit = {}
+            for ai in range(6):
+                d_val = float(dist_buf[ai])
+                gid = int(gid_buf[ai])
+                if d_val > 0.0 and 0 <= gid < n_geoms and gid not in exclude:
+                    per_axis_hit[ai] = (d_val, gid)
+
             for a, b in ((0, 1), (2, 3), (4, 5)):
                 if a not in per_axis_hit or b not in per_axis_hit:
                     continue
@@ -164,13 +189,10 @@ class SkeletonScenePool:
                 d_b, gid_b = per_axis_hit[b]
                 if gid_a != gid_b:
                     continue
-                span = d_a + d_b
-                # Sample is inside geom gid_a. Approx signed distance = -min(d_a, d_b).
                 sd = -min(d_a, d_b)
                 if sd < signed[si]:
                     signed[si] = sd
                     hit_geom[si] = gid_a
-            # Non-penetrating: report closest ray hit as positive clearance
             if not np.isfinite(signed[si]) or signed[si] >= 0.0:
                 best = np.inf
                 best_gid = -1

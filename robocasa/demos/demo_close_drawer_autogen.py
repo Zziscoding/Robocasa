@@ -210,6 +210,20 @@ def _mj_named(model, kind, name):
     return getattr(model, kind)(name)
 
 
+def _mj_id(model, kind, name):
+    name2id = getattr(model, f"{kind}_name2id", None)
+    if name2id is not None:
+        return int(name2id(name))
+    private_map = getattr(model, f"_{kind}_name2id", None)
+    if private_map is not None:
+        return int(private_map[name])
+    obj_type = getattr(mujoco.mjtObj, f"mjOBJ_{kind.upper()}")
+    obj_id = int(mujoco.mj_name2id(model, obj_type, name))
+    if obj_id < 0:
+        raise KeyError(f"Unknown MuJoCo {kind} name: {name}")
+    return obj_id
+
+
 def _make_gripper_contact_rotation(push_world):
     x_axis = _normalize(push_world)
     z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -4996,11 +5010,13 @@ def _create_origin_demo_env(dataset, has_offscreen_renderer=True):
     env_kwargs["has_offscreen_renderer"] = bool(has_offscreen_renderer)
     env_kwargs["use_camera_obs"] = False
     env_kwargs["renderer"] = "mjviewer"
-    return robosuite.make(**env_kwargs)
+    env = robosuite.make(**env_kwargs)
+    env.reset()  # robocasa defers .drawer init until first reset
+    return env
 
 
 def _joint_qpos_slice(model, joint_name):
-    joint_id = model.joint_name2id(joint_name)
+    joint_id = _mj_id(model, "joint", joint_name)
     start = int(model.jnt_qposadr[joint_id])
     end = (
         int(model.jnt_qposadr[joint_id + 1])
@@ -5334,8 +5350,33 @@ def visualize_contact_marker(
         push_distance,
         args,
     )
+    if arm_trajectory.shape[0] == 0:
+        print("Contact visualization skipped: empty trajectory.")
+        return
+
+    # --- PD torque control so the arm respects contacts with the drawer
+    #     instead of teleporting through it (the old _set_env_arm_q did).
+    timestep = float(env.sim.model.opt.timestep)
+    kp = np.full(
+        7, float(getattr(args, "contact_marker_pd_kp", 350.0)), dtype=np.float64
+    )
+    kd = np.full(
+        7, float(getattr(args, "contact_marker_pd_kd", 35.0)), dtype=np.float64
+    )
+    qpos_addrs, dof_addrs, actuator_ids = _arm_pd_control_maps(env, arm_joint_names)
+    target_dt = float(
+        getattr(
+            args,
+            "contact_marker_pd_target_dt",
+            getattr(args, "curobo_interpolation_dt", 0.02),
+        )
+    )
+    sim_steps_per_target = max(int(round(max(target_dt, timestep) / timestep)), 1)
+
     print(
-        f"Showing selected contact point and {trajectory_source} trajectory. "
+        f"Showing selected contact point and {trajectory_source} trajectory "
+        f"(PD: kp={float(kp[0]):.0f}, kd={float(kd[0]):.0f}, "
+        f"steps/target={sim_steps_per_target}). "
         "Close the viewer window or press Ctrl+C to exit."
     )
     try:
@@ -5354,6 +5395,8 @@ def visualize_contact_marker(
     started_at = time.time()
     camera_initialized = False
     frame_index = 0
+    render_count = 0
+    renders_per_target = max(sim_steps_per_target, 1)
     try:
         while True:
             if hasattr(viewer, "is_running") and not viewer.is_running():
@@ -5363,18 +5406,21 @@ def visualize_contact_marker(
                 active_solution = solution_by_candidate.get(
                     int(solution_indices[frame_index])
                 )
-                _set_env_arm_q(env, arm_joint_names, arm_trajectory[frame_index])
+                q_target = np.asarray(arm_trajectory[frame_index], dtype=np.float64)
+                if render_count > 0 and render_count % renders_per_target == 0:
+                    frame_index = (frame_index + 1) % arm_trajectory.shape[0]
+                    active_solution = solution_by_candidate.get(
+                        int(solution_indices[frame_index])
+                    )
+                    q_target = np.asarray(arm_trajectory[frame_index], dtype=np.float64)
                 _set_drawer_joint_value(env, drawer_trajectory[frame_index])
-                env.sim.forward()
+                _step_arm_pd(env, q_target, qpos_addrs, dof_addrs, actuator_ids, kp, kd)
+                render_count += 1
                 if active_solution is not None:
                     marker_pos = (
                         active_solution.drawer_contact_world
                         + panel.outward_world * args.contact_marker_offset
                     )
-                if args.visualize_loop_trajectory:
-                    frame_index = (frame_index + 1) % arm_trajectory.shape[0]
-                else:
-                    frame_index = min(frame_index + 1, arm_trajectory.shape[0] - 1)
             if hasattr(viewer, "user_scn"):
                 viewer.user_scn.ngeom = 0
                 _draw_viewer_sphere(
@@ -5429,6 +5475,55 @@ def parse_args():
     parser.add_argument("--origin-demo-output", type=str, default="")
     parser.add_argument("--origin-demo-video-skip", type=int, default=5)
     parser.add_argument("--origin-demo-extend-states", type=int, default=50)
+    parser.add_argument(
+        "--ts-skeleton",
+        dest="ts_skeleton",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Demo-driven drawer close: extract demo trajectory, solve skeleton "
+        "poses at the reference pose, project across 10Hz interpolated drawer "
+        "poses, filter penetration, animate in a popup (0.1s / frame). "
+        "Enabled by default; disable with --no-ts-skeleton.",
+    )
+    parser.add_argument("--ts-viz-frame-seconds", type=float, default=0.1)
+    parser.add_argument("--ts-viz-render-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--ts-viz-skeleton-pose-limit",
+        type=int,
+        default=120,
+        help="Maximum skeleton poses drawn per visualization timestep. Use <=0 to draw until scene capacity.",
+    )
+    parser.add_argument(
+        "--ts-sample-hz",
+        type=float,
+        default=10.0,
+        help="Drawer trajectory resampling rate (Hz) for the ts-skeleton pipeline.",
+    )
+    parser.add_argument(
+        "--ts-penetration-workers",
+        type=int,
+        default=None,
+        help="Threads for per-frame mj_multiRay penetration filter. Defaults to cpu_count-2.",
+    )
+    parser.add_argument(
+        "--ts-penetration-mjwarp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use mjwarp batched narrowphase for per-frame penetration checking "
+        "(~200x faster than CPU mj_multiRay). Disable with --no-ts-penetration-mjwarp.",
+    )
+    parser.add_argument(
+        "--ts-penetration-mjwarp-batch",
+        type=int,
+        default=512,
+        help="Worlds per mjwarp forward call (higher = more GPU memory but fewer launches).",
+    )
+    parser.add_argument(
+        "--ts-skeleton-max-reference-poses",
+        type=int,
+        default=512,
+        help="Randomly downsample reference skeleton poses to this count before projection.",
+    )
     parser.add_argument("--render", action="store_true")
     parser.add_argument(
         "--visualize-contact", dest="visualize_contact", action="store_true"
@@ -5442,6 +5537,9 @@ def parse_args():
     parser.add_argument("--contact-marker-offset", type=float, default=0.012)
     parser.add_argument("--contact-marker-alpha", type=float, default=1.0)
     parser.add_argument("--contact-marker-fps", type=float, default=30.0)
+    parser.add_argument("--contact-marker-pd-kp", type=float, default=350.0)
+    parser.add_argument("--contact-marker-pd-kd", type=float, default=35.0)
+    parser.add_argument("--contact-marker-pd-target-dt", type=float, default=0.02)
     parser.add_argument("--contact-camera-distance", type=float, default=0.9)
     parser.add_argument("--contact-camera-azimuth", type=float, default=135.0)
     parser.add_argument("--contact-camera-elevation", type=float, default=-25.0)
@@ -5825,6 +5923,9 @@ def main():
     if args.origin_demo:
         save_origin_demo_video(args)
         return
+    if bool(getattr(args, "ts_skeleton", False)):
+        run_timeseries_pipeline(args)
+        return
     if not args.skip_curobo:
         preload_curobo_runtime()
     env = create_close_drawer_env(args)
@@ -6009,13 +6110,97 @@ def _hand_box_from_ghost_geoms(env, frame_name):
     )
 
 
-def _visualize_mink_q_poses_popup(env, q_waypoints, robot_state, args, drawer_q=None):
+def _drawer_panel_pose(env):
+    """Read the current drawer door panel pose from MuJoCo geom data.
+
+    Returns ``(center_world, rotation_world)`` mirroring the ref point used
+    by ``get_panel_frame`` so skeleton poses can be projected onto a moving
+    drawer the same way ``_project_skeleton_poses_to_drawer_pose`` does.
+    """
+    model = env.sim.model
+    data = env.sim.data
+    drawer_name = env.drawer.name
+    reg_name = f"{drawer_name}_door_reg_main"
+    if reg_name in model._geom_name2id:
+        panel_geom = reg_name
+    else:
+        panel_geom = f"{drawer_name}_door_g1"
+    if panel_geom not in model._geom_name2id:
+        return None, None
+    geom_id = model.geom_name2id(panel_geom)
+    center_world = np.asarray(data.geom_xpos[geom_id], dtype=np.float64).reshape(3)
+    rotation_world = np.asarray(data.geom_xmat[geom_id], dtype=np.float64).reshape(3, 3)
+    return center_world, rotation_world
+
+
+def _raw_panel_pose(raw_model, raw_data, panel_geom_name):
+    """Read ``(center_world, rotation_world)`` from raw MuJoCo data."""
+    import mujoco as _mj
+
+    if panel_geom_name is None:
+        return None, None
+    gid = _mj.mj_name2id(raw_model, _mj.mjtObj.mjOBJ_GEOM, panel_geom_name)
+    center = np.asarray(raw_data.geom_xpos[int(gid)], dtype=np.float64).reshape(3)
+    rot = np.asarray(raw_data.geom_xmat[int(gid)], dtype=np.float64).reshape(3, 3)
+    return center, rot
+
+
+def _panel_geom_name(env):
+    """Return the drawer door geom name used to track the panel frame."""
+    model = env.sim.model
+    drawer_name = env.drawer.name
+    reg_name = f"{drawer_name}_door_reg_main"
+    if reg_name in model._geom_name2id:
+        return reg_name
+    alt = f"{drawer_name}_door_g1"
+    if alt in model._geom_name2id:
+        return alt
+    return None
+
+
+def _set_arm_q_direct(raw_model, raw_data, arm_joint_names, q_arm, env):
+    """Set arm joint positions directly into ``raw_data.qpos``."""
+    for joint_name, q_val in zip(arm_joint_names, np.asarray(q_arm).reshape(-1)):
+        try:
+            addr = int(env.sim.model.get_joint_qpos_addr(joint_name))
+        except Exception:
+            continue
+        raw_data.qpos[addr] = float(q_val)
+
+
+def _visualize_mink_q_poses_popup(
+    env,
+    q_waypoints,
+    robot_state,
+    args,
+    drawer_q=None,
+    *,
+    drawer_q_seq=None,
+    ts_poses_ref=None,
+    panel_pose_ref=None,
+    drawer_qpos_addr=None,
+    frame_seconds=None,
+):
+    """Popup viewer rendering ghost Panda hand at every mink q waypoint.
+
+    When ``drawer_q_seq`` is supplied the popup turns into an *animation*:
+    ``drawer_q_seq[i]`` is applied to the drawer joint (via
+    ``raw_data.qpos[drawer_qpos_addr]``) on frame ``i``, the arm is set to
+    ``q_waypoints[i]``, and any reference ``ts_poses_ref`` (a list of
+    ``[drawer_q, PanelFrame, skeleton_poses]`` tuples, typically the output
+    of ``solve_timeseries_skeleton_poses``) is projected to the current
+    drawer panel pose so the skeleton follows the drawer slide.
+
+    Without ``drawer_q_seq`` the behaviour matches the original: draw every
+    q_waypoint pose with the (single, shared) ``drawer_q``.
+    """
     if not bool(getattr(args, "autogen_visualize_mink_poses", True)):
         return
     q_waypoints = np.asarray(q_waypoints, dtype=np.float64)
     if q_waypoints.size == 0:
         return
     q_waypoints = q_waypoints.reshape(-1, 7)
+    n_frames = q_waypoints.shape[0]
     frame_name = str(
         getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
     ).split(":")[0]
@@ -6042,6 +6227,58 @@ def _visualize_mink_q_poses_popup(env, q_waypoints, robot_state, args, drawer_q=
         if drawer_q is None
         else float(drawer_q)
     )
+
+    # --- Validate / normalise animation inputs.  An animation requires BOTH
+    #     a drawer_q_seq AND a drawer_qpos_addr (so we can write the joint
+    #     state directly into the viewer's raw_data each frame).  Anything
+    #     else falls back to the original static behaviour.
+    animate = (
+        drawer_q_seq is not None
+        and drawer_qpos_addr is not None
+        and np.asarray(drawer_q_seq).size > 0
+        and q_waypoints.shape[0] > 1
+    )
+    ref_ts = None  # list[tuple[drawer_q, PanelFrame, list[SkeletonPose]]]
+    ref_panel = None
+    panel_geom_name = None
+    finger_radius = float(getattr(args, "autogen_skeleton_finger_radius", 0.004))
+    frame_seconds_effective = float(
+        frame_seconds
+        if frame_seconds is not None
+        else getattr(args, "autogen_mink_popup_frame_seconds", 0.1)
+    )
+    if animate:
+        drawer_q_seq = np.asarray(drawer_q_seq, dtype=np.float64).reshape(-1)
+        if drawer_q_seq.shape[0] < n_frames:
+            pad = np.full(
+                n_frames - drawer_q_seq.shape[0],
+                float(drawer_q_seq[-1]) if drawer_q_seq.shape[0] else float(drawer_q),
+                dtype=np.float64,
+            )
+            drawer_q_seq = np.concatenate([drawer_q_seq, pad])
+        elif drawer_q_seq.shape[0] > n_frames:
+            drawer_q_seq = drawer_q_seq[:n_frames]
+        drawer_qpos_addr = int(drawer_qpos_addr)
+        if ts_poses_ref:
+            ref_ts = list(ts_poses_ref)
+        if panel_pose_ref is None:
+            try:
+                center, rot = _drawer_panel_pose(env)
+                if center is not None:
+                    ref_panel = (
+                        np.asarray(center, dtype=np.float64).reshape(3).copy(),
+                        np.asarray(rot, dtype=np.float64).reshape(3, 3).copy(),
+                    )
+            except Exception:
+                ref_panel = None
+        else:
+            ref_panel = (
+                np.asarray(panel_pose_ref[0], dtype=np.float64).reshape(3).copy(),
+                np.asarray(panel_pose_ref[1], dtype=np.float64).reshape(3, 3).copy(),
+            )
+        panel_geom_name = _panel_geom_name(env)
+        del ts_poses_ref, panel_pose_ref
+
     poses = []
     try:
         _close_impl._set_drawer_joint_value(env, drawer_q)
@@ -6076,6 +6313,11 @@ def _visualize_mink_q_poses_popup(env, q_waypoints, robot_state, args, drawer_q=
         ],
         dtype=np.float32,
     )
+    green = np.array([0.1, 1.0, 0.2, 0.9], dtype=np.float32)
+    try:
+        skeleton = ee_skelton.build_panda_skeleton(env, frame_name)
+    except Exception:
+        skeleton = None
     with mujoco.viewer.launch_passive(
         raw_model,
         raw_data,
@@ -6102,21 +6344,184 @@ def _visualize_mink_q_poses_popup(env, q_waypoints, robot_state, args, drawer_q=
             getattr(args, "autogen_mink_popup_camera_elevation", -25.0)
         )
         fps = max(float(getattr(args, "autogen_mink_popup_fps", 30.0)), 1.0)
-        while viewer.is_running():
-            if hasattr(viewer, "user_scn"):
-                viewer.user_scn.ngeom = 0
-                for pose_index, (target_pos, target_rot) in enumerate(poses):
-                    rgba = palette[min(pose_index, palette.shape[0] - 1)]
-                    for ghost in ghost_geoms:
-                        viz_mj._add_ghost_geom(
-                            viewer.user_scn,
-                            ghost,
-                            target_pos,
-                            target_rot,
-                            rgba,
+        try:
+            started_at = time.time()
+            frame_idx = 0
+            last_frame_idx = -1
+            while viewer.is_running():
+                # Advance the frame based on wall-clock time when animating, so
+                # user sees the drawer slide + skeleton advance in (close to)
+                # real-time regardless of render FPS.
+                if animate:
+                    elapsed = time.time() - started_at
+                    frame_idx = int(elapsed / frame_seconds_effective) % n_frames
+                if not animate or frame_idx != last_frame_idx:
+                    last_frame_idx = frame_idx
+                    if animate:
+                        raw_data.qpos[drawer_qpos_addr] = float(drawer_q_seq[frame_idx])
+                        q_arm = np.asarray(
+                            q_waypoints[frame_idx], dtype=np.float64
+                        ).reshape(7)
+                        _set_arm_q_direct(
+                            raw_model, raw_data, arm_joint_names, q_arm, env
                         )
-            viewer.sync()
-            time.sleep(1.0 / fps)
+                        mujoco.mj_forward(raw_model, raw_data)
+                    if hasattr(viewer, "user_scn"):
+                        viewer.user_scn.ngeom = 0
+                        if animate:
+                            # Current frame: full-opacity hand + skeleton.
+                            for ghost in ghost_geoms:
+                                viz_mj._add_ghost_geom(
+                                    viewer.user_scn,
+                                    ghost,
+                                    np.asarray(
+                                        raw_data.site_xpos[site_id], dtype=np.float64
+                                    ),
+                                    np.asarray(
+                                        raw_data.site_xmat[site_id], dtype=np.float64
+                                    ).reshape(3, 3),
+                                    np.array([0.05, 0.45, 1.0, 0.95], dtype=np.float32),
+                                )
+                            # Skeletons: either project from ts_poses_ref for
+                            # the nearest frame, or (if only panel_pose_ref was
+                            # supplied) project a single reference bundle.
+                            projected = None
+                            if ref_ts:
+                                # Pick the closest frame by drawer_q.
+                                seq_qs = np.asarray(
+                                    [float(t[0]) for t in ref_ts], dtype=np.float64
+                                )
+                                ref_frame_idx = int(
+                                    np.argmin(np.abs(seq_qs - drawer_q_seq[frame_idx]))
+                                )
+                                ref_bundle = ref_ts[ref_frame_idx]
+                                bundle_panel = (
+                                    np.asarray(
+                                        ref_bundle[1].center_world, dtype=np.float64
+                                    ).reshape(3),
+                                    np.asarray(
+                                        ref_bundle[1].rotation_world, dtype=np.float64
+                                    ).reshape(3, 3),
+                                )
+                                cur_center, cur_rot = (
+                                    _raw_panel_pose(
+                                        raw_model, raw_data, panel_geom_name
+                                    )
+                                    or bundle_panel
+                                )
+                                projected = _project_skeleton_poses_to_drawer_pose(
+                                    list(ref_bundle[2]),
+                                    bundle_panel,
+                                    (cur_center, cur_rot),
+                                )
+                            if projected and skeleton is not None:
+                                _skel_half_ext = None
+                                for sp in projected:
+                                    if viewer.user_scn.ngeom + 3 > int(
+                                        viewer.user_scn.maxgeom
+                                    ):
+                                        break
+                                    ee_pos = np.asarray(
+                                        sp.ee_position, dtype=np.float64
+                                    )
+                                    ee_rot = np.asarray(
+                                        sp.ee_rotation, dtype=np.float64
+                                    )
+                                    try:
+                                        if _skel_half_ext is None:
+                                            _skel_half_ext = np.asarray(
+                                                ee_skelton._flat_hand_half_extents(
+                                                    skeleton
+                                                ),
+                                                dtype=np.float64,
+                                            )
+                                        hand_center_w = ee_pos + ee_rot @ np.asarray(
+                                            skeleton.hand_box_center_ee,
+                                            dtype=np.float64,
+                                        )
+                                        hand_rot_w = ee_rot @ np.asarray(
+                                            skeleton.hand_box_rotation_ee,
+                                            dtype=np.float64,
+                                        )
+                                        ee_skelton._add_box(
+                                            viewer.user_scn,
+                                            hand_center_w,
+                                            hand_rot_w,
+                                            _skel_half_ext,
+                                            np.array(
+                                                [0.1, 1.0, 0.2, 0.7], dtype=np.float32
+                                            ),
+                                        )
+                                        (
+                                            left_seg,
+                                            right_seg,
+                                            _,
+                                            _,
+                                        ) = ee_skelton._finger_segments_with_opening(
+                                            skeleton,
+                                            float(
+                                                getattr(
+                                                    sp,
+                                                    "gripper_opening",
+                                                    ee_skelton.PANDA_DEFAULT_GRIPPER_OPENING,
+                                                )
+                                            ),
+                                        )
+                                        rgba_hand = np.array(
+                                            [0.1, 1.0, 0.2, 0.7], dtype=np.float32
+                                        )
+                                        for seg in (left_seg, right_seg):
+                                            sa = ee_pos + ee_rot @ np.asarray(
+                                                seg[0], dtype=np.float64
+                                            )
+                                            sb = ee_pos + ee_rot @ np.asarray(
+                                                seg[1], dtype=np.float64
+                                            )
+                                            ee_skelton._add_capsule_segment(
+                                                viewer.user_scn,
+                                                sa,
+                                                sb,
+                                                finger_radius,
+                                                green,
+                                            )
+                                    except Exception:
+                                        pass
+                            # Marker on the drawer panel centre.
+                            try:
+                                if panel_geom_name is not None:
+                                    c = _raw_panel_pose(
+                                        raw_model, raw_data, panel_geom_name
+                                    )
+                                    if c is not None and c[0] is not None:
+                                        viz_mj._add_scene_sphere(
+                                            viewer.user_scn,
+                                            np.asarray(c[0], dtype=np.float64),
+                                            0.01,
+                                            np.array(
+                                                [0.9, 0.5, 0.1, 0.9], dtype=np.float32
+                                            ),
+                                        )
+                            except Exception:
+                                pass
+                        else:
+                            for pose_index, (target_pos, target_rot) in enumerate(
+                                poses
+                            ):
+                                rgba = palette[min(pose_index, palette.shape[0] - 1)]
+                                for ghost in ghost_geoms:
+                                    viz_mj._add_ghost_geom(
+                                        viewer.user_scn,
+                                        ghost,
+                                        target_pos,
+                                        target_rot,
+                                        rgba,
+                                    )
+                viewer.sync()
+                time.sleep(1.0 / fps)
+        finally:
+            env.sim.data.qpos[:] = qpos_saved
+            env.sim.data.qvel[:] = qvel_saved
+            env.sim.forward()
 
 
 def _visualize_floating_ee_poses_popup(env, refined_poses, args, drawer_q=None):
@@ -6691,6 +7096,15 @@ def _parse_close_autogen_args(original_parse_args):
     parser.add_argument("--autogen-mink-q-checker-workers", type=int, default=None)
     parser.add_argument("--autogen-mink-q-worlds-per-worker", type=int, default=None)
     parser.add_argument(
+        "--ts-skeleton",
+        dest="ts_skeleton",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--ts-viz-frame-seconds", type=float, default=None)
+    parser.add_argument("--ts-viz-render-fps", type=float, default=None)
+    parser.add_argument("--ts-viz-skeleton-pose-limit", type=int, default=None)
+    parser.add_argument(
         "--solve_step2",
         "--solve-step2",
         dest="solve_step2",
@@ -6857,12 +7271,49 @@ def main():
             and not visualized["done"]
             and bool(getattr(args, "autogen_visualize_mink_poses", False))
         ):
+            q_waypoints = np.asarray(
+                getattr(mink_solution, "q_waypoints", np.zeros((0, 7))),
+                dtype=np.float64,
+            ).reshape(-1, 7)
+            drawer_qpos_addr = None
+            try:
+                drawer_qpos_addr = int(
+                    env.sim.model.get_joint_qpos_addr(env.drawer.door_joint_names[0])
+                )
+            except Exception:
+                drawer_qpos_addr = None
+            drawer_q_seq = None
+            ref_panel_pose = None
+            ts_poses_ref = getattr(args, "_autogen_ts_skeleton_poses", None)
+            if q_waypoints.size > 0 and drawer_qpos_addr is not None:
+                # Close-drawer demo pushes the drawer IN (positive dq ->
+                # toward 0).  Interpolate across the arm waypoints so the
+                # first popup shows the drawer actually sliding instead of
+                # freezing at its start pose.
+                q_start = float(_close_impl._drawer_joint_value(env))
+                n_frames = q_waypoints.shape[0]
+                dj_id = int(env.sim.model.joint_name2id(env.drawer.door_joint_names[0]))
+                jnt_range = np.asarray(env.sim.model.jnt_range[dj_id], dtype=np.float64)
+                q_target = min(q_start + float(push_distance), float(jnt_range[1]))
+                drawer_q_seq = np.linspace(
+                    q_start, q_target, n_frames, dtype=np.float64
+                )
+                try:
+                    ref_panel_pose = _drawer_panel_pose(env)
+                except Exception:
+                    ref_panel_pose = None
             _visualize_mink_q_poses_popup(
                 env,
-                getattr(mink_solution, "q_waypoints", np.zeros((0, 7))),
+                q_waypoints,
                 robot_state,
                 args,
-                drawer_q=float(_close_impl._drawer_joint_value(env)),
+                drawer_q=float(_close_impl._drawer_joint_value(env))
+                if drawer_q_seq is None
+                else float(drawer_q_seq[0]),
+                drawer_q_seq=drawer_q_seq,
+                ts_poses_ref=ts_poses_ref,
+                panel_pose_ref=ref_panel_pose,
+                drawer_qpos_addr=drawer_qpos_addr,
             )
             visualized["done"] = True
         return result
@@ -7133,6 +7584,996 @@ def main():
             _ee_skelton._draw_skeleton_into_scene = original_draw_skeleton
         if original_build_skeleton is not None and _ee_skelton is not None:
             _ee_skelton.build_panda_skeleton = original_build_skeleton
+
+
+# ---------------------------------------------------------------------------
+# Time-series skeleton poses from demonstration + DAQP + penetration filter
+# ---------------------------------------------------------------------------
+
+
+def _extract_drawer_trajectory_from_demo(args):
+    """Load the origin demonstration and extract drawer + robot arm trajectories.
+
+    Returns ``(times, drawer_qs, robot_arm_qs, arm_joint_names, duration,
+    episode_name, initial_state, states)``.
+
+    The LeRobot dataset state vector layout (nq/nv) may differ from the
+    current env, which breaks ``reset_to``.  When that happens we fall back
+    to a synthesized ramp from the current drawer position to fully closed
+    and hold ``robot_arm_qs`` at the source env's current arm qpos.
+    """
+    dataset, episode_name, initial_state, states = _load_origin_demo_episode(args)
+    source_env = _create_origin_demo_env(dataset, has_offscreen_renderer=False)
+    try:
+        control_freq = float(getattr(args, "control_freq", 20.0))
+        drawer_joint_name = source_env.drawer.door_joint_names[0]
+        addr = source_env.sim.model.get_joint_qpos_addr(drawer_joint_name)
+        arm_joint_names = tuple(source_env.robots[0].robot_model.joints[:7])
+        arm_addrs = [
+            source_env.sim.model.get_joint_qpos_addr(n) for n in arm_joint_names
+        ]
+        n_frames = states.shape[0]
+        drawer_qs = np.zeros(n_frames, dtype=np.float64)
+        robot_arm_qs = np.zeros((n_frames, len(arm_joint_names)), dtype=np.float64)
+
+        # Attempt 1: restore each state via reset_to.
+        try:
+            for i, state in enumerate(states):
+                reset_to(source_env, {"states": state})
+                drawer_qs[i] = float(source_env.sim.data.qpos[addr])
+                robot_arm_qs[i, :] = [
+                    float(source_env.sim.data.qpos[a]) for a in arm_addrs
+                ]
+        except Exception as exc:
+            print(
+                f"[ts-skel] reset_to extraction failed ({exc}); "
+                "falling back to synthesized trajectory.",
+                flush=True,
+            )
+            drawer_qs[:] = 0.0
+            robot_arm_qs[:] = 0.0
+
+        # Attempt 2 (fallback): synthesise from the drawer's current range.
+        if np.std(drawer_qs) < 1e-6:
+            dj_id = int(source_env.sim.model.joint_name2id(drawer_joint_name))
+            jnt_range = np.asarray(
+                source_env.sim.model.jnt_range[dj_id], dtype=np.float64
+            )
+            q_current = float(
+                source_env.sim.data.qpos[
+                    source_env.sim.model.get_joint_qpos_addr(drawer_joint_name)
+                ]
+            )
+            q_closed = float(jnt_range[0])  # most negative = fully closed
+            t = np.linspace(0.0, 1.0, n_frames, dtype=np.float64)
+            drawer_qs = q_current + (q_closed - q_current) * t
+            cur_arm = np.asarray(
+                [float(source_env.sim.data.qpos[a]) for a in arm_addrs],
+                dtype=np.float64,
+            )
+            robot_arm_qs[:] = cur_arm[None, :]
+            print(
+                f"[ts-skel] synthesized drawer trajectory "
+                f"{q_current:.4f} -> {q_closed:.4f} over {n_frames} frames "
+                f"(robot arm held constant)",
+                flush=True,
+            )
+
+        times = np.arange(n_frames, dtype=np.float64) / control_freq
+        duration = float(times[-1]) if n_frames > 0 else 0.0
+        return (
+            times,
+            np.asarray(drawer_qs, dtype=np.float64),
+            robot_arm_qs,
+            arm_joint_names,
+            duration,
+            episode_name,
+            initial_state,
+            states,
+        )
+    finally:
+        source_env.close()
+
+
+def _interpolate_drawer_poses(times, drawer_qs, robot_arm_qs=None, hz=10.0):
+    """Interpolate drawer + optional arm trajectory at a fixed ``hz`` sampling rate."""
+    if len(times) == 0:
+        return (
+            np.zeros(0, dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
+            (None if robot_arm_qs is None else np.zeros((0, 0), dtype=np.float64)),
+        )
+    t_end = float(times[-1])
+    n_frames = max(int(round(t_end * hz)) + 1, 2)
+    new_times = np.linspace(0.0, t_end, n_frames, dtype=np.float64)
+    new_drawer_qs = np.interp(new_times, times, drawer_qs)
+    new_arm_qs = None
+    if robot_arm_qs is not None and robot_arm_qs.size > 0:
+        arm = np.asarray(robot_arm_qs, dtype=np.float64)
+        if arm.ndim == 1:
+            arm = arm.reshape(-1, 1)
+        new_arm_qs = np.stack(
+            [np.interp(new_times, times, arm[:, j]) for j in range(arm.shape[1])],
+            axis=1,
+        )
+    return new_times, new_drawer_qs, new_arm_qs
+
+
+# Keep the old name as a thin backward-compatible alias so any external caller
+# expecting the 20Hz-labelled entry point still works.
+def _interpolate_drawer_poses_20hz(times, drawer_qs, hz=20.0):
+    nt, nq, _ = _interpolate_drawer_poses(times, drawer_qs, None, hz=hz)
+    return nt, nq
+
+
+def _project_skeleton_poses_to_drawer_pose(
+    skeleton_poses,
+    panel_pose_at_ref,
+    panel_pose_at_new,
+):
+    """Project skeleton poses solved at ``panel_pose_at_ref`` to the new
+    panel frame by applying the rigid drawer displacement in world."""
+    if not skeleton_poses:
+        return []
+    c_ref, R_ref = panel_pose_at_ref
+    c_new, R_new = panel_pose_at_new
+    dR = R_new @ R_ref.T
+    dp = c_new - dR @ c_ref
+    projected = []
+    for sp in skeleton_poses:
+        projected.append(
+            ee_skelton.SkeletonPose(
+                ee_position=dR @ np.asarray(sp.ee_position, dtype=np.float64) + dp,
+                ee_rotation=dR @ np.asarray(sp.ee_rotation, dtype=np.float64),
+                contact_finger=sp.contact_finger,
+                contact_point_world=dR
+                @ np.asarray(sp.contact_point_world, dtype=np.float64)
+                + dp,
+                contact_normal_world=dR
+                @ np.asarray(sp.contact_normal_world, dtype=np.float64),
+                qp_cost=sp.qp_cost,
+                lift=sp.lift,
+                theta=sp.theta,
+                gripper_opening=sp.gripper_opening,
+                contact_primitive=sp.contact_primitive,
+            )
+        )
+    return projected
+
+
+def _solve_reference_skeleton_poses(env, panel, args):
+    """Solve skeleton Poses at a given drawer configuration using DAQP.
+    Returns ``(skeleton, ref_poses, feasible_cache, scene_geom_ids,
+    object_eqs, initial_rot)``."""
+    from robocasa.demos import ee_skelton as _skel
+
+    frame_name = str(args.mink_contact_frame).split(":")[0]
+    if frame_name not in env.sim.model._site_name2id:
+        raise RuntimeError(
+            f"mink contact frame '{frame_name}' is not present in the simulation model."
+        )
+
+    feasible_cache = getattr(args, "_autogen_feasible_cache", None)
+    if feasible_cache is None:
+        _, _, feasible_cache = _build_autogen_contact_candidates(env, panel, 0.0, args)
+
+    skeleton = _skel.build_panda_skeleton(env, frame_name)
+    select_count = int(getattr(args, "autogen_initial_pose_count", 200))
+    (
+        local_ids,
+        points_world,
+        normals_world,
+    ) = _select_close_panel_interior_feasible_points(
+        feasible_cache,
+        panel,
+        select_count,
+        int(args.seed),
+        args,
+    )
+    scene_geom_ids = _scene_geom_ids_for_skeleton(env, panel)
+    object_eqs = getattr(feasible_cache, "handle_convex_equations", None)
+    initial_rot = _current_site_pose(env, frame_name)[1]
+
+    variants_per_contact = max(
+        1, int(getattr(args, "autogen_skeleton_pose_variants_per_contact", 4))
+    )
+    theta_sep = float(
+        getattr(args, "autogen_skeleton_pose_min_theta_separation", np.pi / 6.0)
+    )
+    primitive_specs = (
+        ("left_finger", "left"),
+        ("right_finger", "right"),
+        ("hand", "left"),
+    )
+
+    # Build jobs: one (local_id, point, normal, primitive, finger) per candidate x primitive.
+    jobs = []
+    for local_id, point, normal in zip(local_ids, points_world, normals_world):
+        for primitive, finger in primitive_specs:
+            jobs.append(
+                (
+                    int(local_id),
+                    np.asarray(point, dtype=np.float64),
+                    np.asarray(normal, dtype=np.float64),
+                    primitive,
+                    finger,
+                )
+            )
+
+    # Same parallel-DAQP pattern as _solve_contact_poses_with_skeleton (~L2195):
+    # SkeletonScenePool + ThreadPoolExecutor + per-worker MjData clone.
+    workers_arg = (
+        getattr(args, "autogen_skeleton_parallel_workers", None)
+        or getattr(args, "autogen_mink_parallel_workers", None)
+        or max(1, (os.cpu_count() or 4) - 2)
+    )
+    workers = max(1, int(workers_arg))
+    active_workers = max(1, min(workers, len(jobs) or 1))
+
+    scene_pool = getattr(args, "_autogen_ts_scene_pool", None)
+    if scene_pool is None:
+        try:
+            from robocasa.demos.skelton_scene import SkeletonScenePool
+
+            scene_pool = SkeletonScenePool.from_env(env, num_workers=active_workers)
+            args._autogen_ts_scene_pool = scene_pool
+        except Exception as exc:
+            print(f"[ts-skel] SkeletonScenePool init failed: {exc}", flush=True)
+            scene_pool = None
+    else:
+        try:
+            scene_pool.reset()
+        except Exception:
+            pass
+
+    print(
+        f"[ts-skel] REFERENCE_SKELETON_POSE_SOLVER backend=daqp "
+        f"workers={active_workers} jobs={len(jobs)} "
+        f"variants_per_contact={variants_per_contact}",
+        flush=True,
+    )
+
+    def _solve_ref_job(job):
+        local_id, point, normal, primitive, finger = job
+        try:
+            if scene_pool is not None:
+                with scene_pool.borrow() as rmd:
+                    poses = _skel.solve_skeleton_pose_candidates(
+                        env,
+                        skeleton,
+                        point,
+                        normal,
+                        finger=finger,
+                        contact_primitive=primitive,
+                        object_convex_equations=object_eqs,
+                        object_convex_equation_mask=None,
+                        scene_geom_ids=scene_geom_ids,
+                        initial_ee_rotation_world=None,
+                        args=args,
+                        max_candidates=variants_per_contact,
+                        min_theta_separation=theta_sep,
+                        raw_model_data=rmd,
+                    )
+            else:
+                raw_model = getattr(env.sim.model, "_model", env.sim.model)
+                raw_data = getattr(env.sim.data, "_data", env.sim.data)
+                poses = _skel.solve_skeleton_pose_candidates(
+                    env,
+                    skeleton,
+                    point,
+                    normal,
+                    finger=finger,
+                    contact_primitive=primitive,
+                    object_convex_equations=object_eqs,
+                    object_convex_equation_mask=None,
+                    scene_geom_ids=scene_geom_ids,
+                    initial_ee_rotation_world=None,
+                    args=args,
+                    max_candidates=variants_per_contact,
+                    min_theta_separation=theta_sep,
+                    raw_model_data=(raw_model, raw_data),
+                )
+            return int(local_id), list(poses), None
+        except Exception as exc:
+            return int(local_id), [], f"{exc.__class__.__name__}:{exc}"
+
+    try:
+        from tqdm import tqdm as _tqdm
+    except Exception:
+        _tqdm = None
+    pbar = (
+        _tqdm(
+            total=len(jobs),
+            desc=f"ref-daqp (workers={active_workers})",
+            unit="job",
+            file=sys.__stdout__,
+            dynamic_ncols=True,
+            mininterval=0.2,
+            leave=True,
+        )
+        if _tqdm is not None
+        else None
+    )
+
+    all_poses = []
+    failures = {}
+    if active_workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            _lid, poses, err = _solve_ref_job(job)
+            if err is not None:
+                failures[err] = failures.get(err, 0) + 1
+            else:
+                all_poses.extend(poses)
+            if pbar is not None:
+                pbar.update(1)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=active_workers) as ex:
+            futures = [ex.submit(_solve_ref_job, job) for job in jobs]
+            for fut in concurrent.futures.as_completed(futures):
+                _lid, poses, err = fut.result()
+                if err is not None:
+                    failures[err] = failures.get(err, 0) + 1
+                else:
+                    all_poses.extend(poses)
+                if pbar is not None:
+                    pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+
+    if failures:
+        top = sorted(failures.items(), key=lambda kv: -kv[1])[:3]
+        print(
+            f"[ts-skel] reference DAQP: {sum(failures.values())} / {len(jobs)} jobs failed; "
+            f"top errors: {top}",
+            flush=True,
+        )
+    return skeleton, all_poses, feasible_cache, scene_geom_ids, object_eqs, initial_rot
+
+
+def solve_timeseries_skeleton_poses(args):
+    """End-to-end: demo drawer traj -> 10Hz poses -> DAQP skeleton solve ->
+    project -> mj_multiRay penetration filter.  Returns ``(ts_poses, env)``.
+
+    ``ts_poses`` entries: ``(drawer_q, panel_cur, [(pose_id, pose), ...],
+    frame_idx)``.  ``pose_id`` is assigned once at the reference frame and
+    kept across projection/filtering so downstream code can tell which
+    reference pose was dropped where."""
+    from robocasa.demos import ee_skelton as _skel
+
+    print("[ts-skel] extracting drawer + robot trajectory from demo...", flush=True)
+    (
+        times,
+        drawer_qs_demo,
+        robot_arm_qs_demo,
+        arm_joint_names_demo,
+        duration,
+        episode_name,
+        initial_state,
+        states,
+    ) = _extract_drawer_trajectory_from_demo(args)
+    print(
+        f"[ts-skel] demo: episode={episode_name} duration={duration:.2f}s "
+        f"n_frames={len(times)} arm_qs_shape={robot_arm_qs_demo.shape}",
+        flush=True,
+    )
+
+    ts_hz = float(getattr(args, "ts_sample_hz", 10.0))
+    new_times, new_drawer_qs, new_arm_qs = _interpolate_drawer_poses(
+        times,
+        drawer_qs_demo,
+        robot_arm_qs_demo,
+        hz=ts_hz,
+    )
+    print(
+        f"[ts-skel] interpolated to {ts_hz:.1f}Hz: {len(new_drawer_qs)} frames, "
+        f"dt={1.0 / ts_hz:.3f}s duration={duration:.2f}s",
+        flush=True,
+    )
+    # Record-only (per user: robot trajectory is loaded but does not drive the scene).
+    args._autogen_ts_times = new_times
+    args._autogen_ts_drawer_qs = new_drawer_qs
+    args._autogen_ts_robot_qs = new_arm_qs
+    args._autogen_ts_arm_joint_names = arm_joint_names_demo
+    args._autogen_ts_duration = duration
+
+    env = create_close_drawer_env(args)
+    try:
+        reset_to(env, initial_state)
+        _set_drawer_joint_value(env, float(new_drawer_qs[0]))
+        env.sim.forward()
+        panel_ref = get_panel_frame(env)
+
+        print(
+            "[ts-skel] solving skeleton poses at reference drawer pose ...", flush=True
+        )
+        (
+            skeleton,
+            ref_poses,
+            _fcache,
+            _sgids,
+            _oeqs,
+            _irot,
+        ) = _solve_reference_skeleton_poses(env, panel_ref, args)
+        if not ref_poses:
+            print(
+                "[ts-skel] DAQP solve returned no skeleton poses at reference.",
+                flush=True,
+            )
+            return [], env
+        ref_poses = [p for p in ref_poses if isinstance(p, _skel.SkeletonPose)]
+        max_ref_poses = int(getattr(args, "ts_skeleton_max_reference_poses", 512))
+        if max_ref_poses > 0 and len(ref_poses) > max_ref_poses:
+            rng = np.random.default_rng(int(getattr(args, "seed", 0)))
+            keep_indices = np.sort(
+                rng.choice(len(ref_poses), size=max_ref_poses, replace=False)
+            )
+            original_count = len(ref_poses)
+            ref_poses = [ref_poses[int(i)] for i in keep_indices]
+            args._autogen_ts_reference_sample_indices = keep_indices
+            print(
+                f"[ts-skel] downsampled reference skeleton poses: "
+                f"{original_count} -> {len(ref_poses)} "
+                f"(seed={int(getattr(args, 'seed', 0))})",
+                flush=True,
+            )
+        else:
+            args._autogen_ts_reference_sample_indices = np.arange(
+                len(ref_poses), dtype=np.int64
+            )
+        # Assign a stable pose_id per reference pose; carried through project + filter.
+        ref_id_poses = list(enumerate(ref_poses))  # [(pose_id, pose), ...]
+        n_ref = len(ref_id_poses)
+        print(
+            f"[ts-skel] reference skeleton poses: {n_ref} (IDs 0..{n_ref - 1})",
+            flush=True,
+        )
+
+        scene_pool = getattr(args, "_autogen_ts_scene_pool", None)
+        pen_workers = int(
+            getattr(args, "ts_penetration_workers", None)
+            or getattr(args, "autogen_skeleton_parallel_workers", None)
+            or getattr(args, "autogen_mink_parallel_workers", None)
+            or max(1, (os.cpu_count() or 4) - 2)
+        )
+        if scene_pool is None or getattr(scene_pool, "num_workers", 1) < pen_workers:
+            try:
+                from robocasa.demos.skelton_scene import SkeletonScenePool
+
+                scene_pool = SkeletonScenePool.from_env(env, num_workers=pen_workers)
+                args._autogen_ts_scene_pool = scene_pool
+            except Exception as exc:
+                print(f"[ts-skel] SkeletonScenePool init failed: {exc}", flush=True)
+                scene_pool = None
+
+        finger_radius = float(getattr(args, "autogen_skeleton_finger_radius", 0.004))
+        penetration_tol = float(
+            getattr(args, "autogen_skeleton_object_penetration_tol", 0.001)
+        )
+
+        # --- GPU (mjwarp) penetration checker ---------------------------------
+        # Batched narrowphase in a stripped floating-hand + static-kitchen scene
+        # (drawer subtree excluded, since drawer is the intended contact target).
+        # ~200x faster than the per-pose CPU mj_multiRay loop for ~3k poses.
+        mjwarp_checker = None
+        use_mjwarp = bool(getattr(args, "ts_penetration_mjwarp", True))
+        if use_mjwarp:
+            try:
+                from robocasa.demos.ts_penetration_mjwarp import (
+                    MjwarpSkelPenChecker,
+                    _drawer_body_ids,
+                    _robot_geom_ids,
+                )
+
+                # exclude = drawer subtree geoms + robot geoms + handle-inflating geoms.
+                drawer_body_ids = _drawer_body_ids(env)
+                raw_model = getattr(env.sim.model, "_model", env.sim.model)
+                drawer_geom_ids = {
+                    int(g)
+                    for g in range(int(raw_model.ngeom))
+                    if int(raw_model.geom_bodyid[g]) in drawer_body_ids
+                }
+                robot_ids = _robot_geom_ids(env)
+                inflating_ids = set()
+                try:
+                    for name in _inflating_handle_geom_names(env):
+                        if name in env.sim.model._geom_name2id:
+                            inflating_ids.add(int(env.sim.model._geom_name2id[name]))
+                except Exception:
+                    pass
+                exclude_ids = drawer_geom_ids | robot_ids | inflating_ids
+                mjwarp_batch = int(getattr(args, "ts_penetration_mjwarp_batch", 512))
+                mjwarp_batch = max(1, min(mjwarp_batch, max(1, n_ref)))
+                frame_name_str = str(args.mink_contact_frame).split(":")[0]
+                mjwarp_checker = MjwarpSkelPenChecker(
+                    env,
+                    ee_site_name=frame_name_str,
+                    exclude_geom_ids=exclude_ids,
+                    batch_size=mjwarp_batch,
+                )
+                print(
+                    f"[ts-skel] mjwarp penetration checker: "
+                    f"backend={mjwarp_checker.stats.backend_kind} "
+                    f"batch={mjwarp_checker.stats.n_worlds} "
+                    f"static_geoms={mjwarp_checker.stats.n_static_geoms} "
+                    f"hand_geoms={mjwarp_checker.stats.n_hand_geoms} "
+                    f"build_s={mjwarp_checker.stats.build_seconds:.2f}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[ts-skel] mjwarp checker init failed ({exc}); "
+                    "falling back to CPU mj_multiRay checker.",
+                    flush=True,
+                )
+                mjwarp_checker = None
+
+        ts_poses = []
+        panel_ref_tuple = (
+            panel_ref.center_world.copy(),
+            panel_ref.rotation_world.copy(),
+        )
+
+        try:
+            from tqdm import tqdm as _tqdm
+        except Exception:
+            _tqdm = None
+        frame_pbar = (
+            _tqdm(
+                total=len(new_drawer_qs),
+                desc="ts-frames",
+                unit="frame",
+                file=sys.__stdout__,
+                dynamic_ncols=True,
+                mininterval=0.2,
+                leave=True,
+            )
+            if _tqdm is not None
+            else None
+        )
+
+        # Precompute reference ee positions/rotations once (they don't change).
+        ee_positions_ref = np.stack(
+            [np.asarray(p.ee_position, dtype=np.float64) for _pid, p in ref_id_poses],
+            axis=0,
+        )  # (n_ref, 3)
+        ee_rotations_ref = np.stack(
+            [np.asarray(p.ee_rotation, dtype=np.float64) for _pid, p in ref_id_poses],
+            axis=0,
+        )  # (n_ref, 3, 3)
+        contact_points_ref = np.stack(
+            [
+                np.asarray(p.contact_point_world, dtype=np.float64)
+                for _pid, p in ref_id_poses
+            ],
+            axis=0,
+        )
+        contact_normals_ref = np.stack(
+            [
+                np.asarray(p.contact_normal_world, dtype=np.float64)
+                for _pid, p in ref_id_poses
+            ],
+            axis=0,
+        )
+
+        for frame_idx, drawer_q in enumerate(new_drawer_qs):
+            _set_drawer_joint_value(env, float(drawer_q))
+            env.sim.forward()
+            panel_cur = get_panel_frame(env)
+            panel_cur_tuple = (panel_cur.center_world, panel_cur.rotation_world)
+
+            # Vectorized rigid projection: apply (dR, dp) to ee_pos, ee_rot in one shot.
+            c_ref, R_ref = panel_ref_tuple
+            c_new, R_new = panel_cur_tuple
+            dR = R_new @ R_ref.T
+            dp = c_new - dR @ c_ref
+            new_positions = ee_positions_ref @ dR.T + dp[None, :]  # (n_ref, 3)
+            new_rotations = dR[None, :, :] @ ee_rotations_ref  # (n_ref, 3, 3)
+            new_contact_pts = contact_points_ref @ dR.T + dp[None, :]
+            new_contact_normals = contact_normals_ref @ dR.T
+
+            projected = [
+                (
+                    pid,
+                    ee_skelton.SkeletonPose(
+                        ee_position=new_positions[i],
+                        ee_rotation=new_rotations[i],
+                        contact_finger=ref_id_poses[i][1].contact_finger,
+                        contact_point_world=new_contact_pts[i],
+                        contact_normal_world=new_contact_normals[i],
+                        qp_cost=ref_id_poses[i][1].qp_cost,
+                        lift=ref_id_poses[i][1].lift,
+                        theta=ref_id_poses[i][1].theta,
+                        gripper_opening=ref_id_poses[i][1].gripper_opening,
+                        contact_primitive=ref_id_poses[i][1].contact_primitive,
+                    ),
+                )
+                for i, (pid, _p) in enumerate(ref_id_poses)
+            ]
+
+            if projected and mjwarp_checker is not None:
+                try:
+                    t_pen0 = time.perf_counter()
+                    keep_mask = mjwarp_checker.check_batch(
+                        new_positions,
+                        new_rotations,
+                        tol=penetration_tol,
+                    )
+                    kept = [
+                        (pid, sp)
+                        for i, (pid, sp) in enumerate(projected)
+                        if bool(keep_mask[i])
+                    ]
+                    dropped_ids = [
+                        pid
+                        for i, (pid, _) in enumerate(projected)
+                        if not bool(keep_mask[i])
+                    ]
+                    projected = kept
+                    if frame_idx % 5 == 0:
+                        print(
+                            f"[ts-skel] frame {frame_idx} mjwarp filter "
+                            f"kept={len(projected)}/{len(ref_id_poses)} "
+                            f"dropped_ids={dropped_ids[:10]}"
+                            f"{'...' if len(dropped_ids) > 10 else ''} "
+                            f"t={time.perf_counter() - t_pen0:.3f}s",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        f"[ts-skel] frame {frame_idx} mjwarp check failed: {exc}",
+                        flush=True,
+                    )
+
+            ts_poses.append((float(drawer_q), panel_cur, projected, frame_idx))
+            if frame_pbar is not None:
+                frame_pbar.update(1)
+
+        if frame_pbar is not None:
+            frame_pbar.close()
+
+        print(
+            f"[ts-skel] done. total frames={len(ts_poses)}, "
+            f"avg poses/frame={np.mean([len(t[2]) for t in ts_poses]):.1f}, "
+            f"n_ref_poses={n_ref}",
+            flush=True,
+        )
+        # Stash n_ref so the visualizer can size palette by ID rather than max poses.
+        args._autogen_ts_n_ref_poses = n_ref
+        return ts_poses, env
+    except Exception as exc:
+        print(f"[ts-skel] error: {exc}", flush=True)
+        import traceback
+
+        traceback.print_exc()
+        try:
+            env.close()
+        except Exception:
+            pass
+        return [], None
+
+
+def _panel_frame_from_raw(raw_data, raw_model, drawer_name):
+    """Read PanelFrame from raw MuJoCo data (thread-safe with viewer)."""
+    panel_geom_name = f"{drawer_name}_door_reg_main"
+    try:
+        gid = mujoco.mj_name2id(raw_model, mujoco.mjtObj.mjOBJ_GEOM, panel_geom_name)
+    except Exception:
+        panel_geom_name = f"{drawer_name}_door_g1"
+        gid = mujoco.mj_name2id(raw_model, mujoco.mjtObj.mjOBJ_GEOM, panel_geom_name)
+    gid = int(gid)
+    center = np.array(raw_data.geom_xpos[gid], dtype=np.float64).reshape(3)
+    rot = np.array(raw_data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
+    half_size = np.asarray(raw_model.geom_size[gid], dtype=np.float64).copy()
+    outward = -rot[:, 1]
+    push_world = -outward
+    if np.dot(push_world, rot[:, 1]) < 0.0:
+        rot[:, 1] *= -1.0
+    return PanelFrame(
+        center_world=center,
+        rotation_world=rot,
+        half_size=half_size,
+        outward_world=outward,
+        push_world=push_world,
+        geom_name=panel_geom_name,
+    )
+
+
+def visualize_timeseries_skeleton_poses(ts_poses, env, skeleton, args):
+    """Animate drawer + skeleton poses in a passive MuJoCo popup."""
+    if not ts_poses:
+        print("[ts-viz] no time-series poses to visualize.", flush=True)
+        return
+
+    import contextlib
+    import io
+    import mujoco
+    import mujoco.viewer
+    from robocasa.demos import visualize_mujoco as viz_mj
+    from robocasa.demos import ee_skelton as _skel
+
+    drawer_centers = np.asarray(
+        [np.asarray(t[1].center_world, dtype=np.float64) for t in ts_poses]
+    )
+    lookat = drawer_centers.mean(axis=0)
+    finger_radius = float(getattr(args, "autogen_skeleton_finger_radius", 0.004))
+    n_frames_total = len(ts_poses)
+    # ts_poses[i][2] is [(pose_id, pose), ...] with stable IDs 0..n_ref-1.
+    # Size the palette by n_ref so each pose_id has its own color across frames.
+    n_ref_poses = int(getattr(args, "_autogen_ts_n_ref_poses", 0)) or max(
+        (max((pid for pid, _ in t[2]), default=0) + 1 for t in ts_poses),
+        default=1,
+    )
+    palette = _skel._hsv_palette(max(n_ref_poses, 1)).astype(np.float32)
+    show_labels = bool(getattr(args, "ts_viz_show_labels", True))
+    viz_pose_limit_raw = getattr(args, "ts_viz_skeleton_pose_limit", None)
+    if viz_pose_limit_raw is None:
+        viz_pose_limit_raw = getattr(args, "autogen_visualize_skeleton_pose_limit", 120)
+    viz_pose_limit = int(viz_pose_limit_raw)
+
+    qpos_saved = env.sim.data.qpos.copy()
+    qvel_saved = env.sim.data.qvel.copy()
+
+    raw_model = getattr(env.sim.model, "_model", env.sim.model)
+    raw_data = getattr(env.sim.data, "_data", env.sim.data)
+    drawer_joint_name = env.drawer.door_joint_names[0]
+    drawer_qpos_addr = int(
+        raw_model.jnt_qposadr[_mj_id(raw_model, "joint", drawer_joint_name)]
+    )
+
+    frame_duration = float(getattr(args, "ts_viz_frame_seconds", 0.1))
+    print(
+        f"[ts-viz] launching popup: {n_frames_total} frames, "
+        f"1 update / {frame_duration:.1f}s. Close window or Ctrl+C to exit.",
+        flush=True,
+    )
+
+    try:
+        with mujoco.viewer.launch_passive(
+            raw_model,
+            raw_data,
+            show_left_ui=False,
+            show_right_ui=False,
+        ) as viewer:
+            try:
+                viewer.opt.geomgroup[:] = 1
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
+            except Exception:
+                pass
+            viewer.cam.type = 0
+            viewer.cam.fixedcamid = -1
+            viewer.cam.lookat[:] = lookat
+            viewer.cam.distance = float(
+                getattr(args, "autogen_mink_popup_camera_distance", 0.85)
+            )
+            viewer.cam.azimuth = float(
+                getattr(args, "autogen_mink_popup_camera_azimuth", 135.0)
+            )
+            viewer.cam.elevation = float(
+                getattr(args, "autogen_mink_popup_camera_elevation", -25.0)
+            )
+
+            render_fps = max(float(getattr(args, "ts_viz_render_fps", 30.0)), 1.0)
+            render_interval = 1.0 / render_fps
+
+            frame_idx = 0
+            drawer_q_from = float(ts_poses[0][0])
+            drawer_q_to = (
+                float(ts_poses[1 % n_frames_total][0])
+                if n_frames_total > 1
+                else drawer_q_from
+            )
+            panel_ref_tuple = (
+                ts_poses[0][1].center_world.copy(),
+                ts_poses[0][1].rotation_world.copy(),
+            )
+            # Frame entries are [(pose_id, pose), ...] with stable IDs.
+            frame_id_poses = list(ts_poses[0][2])
+            started_at = time.time()
+
+            while viewer.is_running():
+                elapsed = time.time() - started_at
+                alpha = min(elapsed / frame_duration, 1.0)
+
+                cur_drawer_q = (1.0 - alpha) * drawer_q_from + alpha * drawer_q_to
+                raw_data.qpos[drawer_qpos_addr] = float(cur_drawer_q)
+                mujoco.mj_forward(raw_model, raw_data)
+
+                panel_cur = _panel_frame_from_raw(raw_data, raw_model, env.drawer.name)
+                panel_cur_tuple = (
+                    panel_cur.center_world.copy(),
+                    panel_cur.rotation_world.copy(),
+                )
+                if frame_id_poses:
+                    proj_poses = _project_skeleton_poses_to_drawer_pose(
+                        [p for _pid, p in frame_id_poses],
+                        panel_ref_tuple,
+                        panel_cur_tuple,
+                    )
+                    cur_id_poses = list(
+                        zip(
+                            [pid for pid, _p in frame_id_poses],
+                            proj_poses,
+                        )
+                    )
+                else:
+                    cur_id_poses = []
+
+                if hasattr(viewer, "user_scn"):
+                    viewer.user_scn.ngeom = 0
+                    _draw_fn = getattr(_skel, "_draw_skeleton_into_scene", None)
+                    drawn_pose_count = 0
+                    if _draw_fn is not None:
+                        poses_to_draw = cur_id_poses
+                        if viz_pose_limit > 0:
+                            poses_to_draw = poses_to_draw[:viz_pose_limit]
+                        for pid, sp in poses_to_draw:
+                            # Skeleton: 1 hand box + 2 finger capsules. Markers add
+                            # contact + label spheres, so reserve conservatively.
+                            if viewer.user_scn.ngeom + 8 > int(viewer.user_scn.maxgeom):
+                                break
+                            rgba = palette[int(pid) % palette.shape[0]].copy()
+                            rgba_hand = rgba.copy()
+                            rgba_hand[3] = max(float(rgba_hand[3]), 0.75)
+                            before = int(viewer.user_scn.ngeom)
+                            try:
+                                with contextlib.redirect_stdout(
+                                    io.StringIO()
+                                ), contextlib.redirect_stderr(io.StringIO()):
+                                    _draw_fn(
+                                        viewer.user_scn,
+                                        skeleton,
+                                        np.asarray(sp.ee_position, dtype=np.float64),
+                                        np.asarray(sp.ee_rotation, dtype=np.float64),
+                                        float(
+                                            getattr(
+                                                sp,
+                                                "gripper_opening",
+                                                _skel.PANDA_DEFAULT_GRIPPER_OPENING,
+                                            )
+                                        ),
+                                        rgba_hand,
+                                        rgba,
+                                        finger_radius,
+                                    )
+                            except Exception:
+                                try:
+                                    half = np.asarray(
+                                        _skel._flat_hand_half_extents(skeleton),
+                                        dtype=np.float64,
+                                    )
+                                    _skel._add_box(
+                                        viewer.user_scn,
+                                        np.asarray(sp.ee_position, dtype=np.float64),
+                                        np.asarray(sp.ee_rotation, dtype=np.float64),
+                                        half,
+                                        rgba_hand,
+                                    )
+                                except Exception:
+                                    pass
+                            if int(viewer.user_scn.ngeom) == before:
+                                continue
+                            drawn_pose_count += 1
+                            # Contact marker: makes each timestep's retained pose set
+                            # visible even when hand geometry overlaps the drawer.
+                            if viewer.user_scn.ngeom < int(viewer.user_scn.maxgeom):
+                                try:
+                                    viz_mj._add_scene_sphere(
+                                        viewer.user_scn,
+                                        np.asarray(
+                                            sp.contact_point_world, dtype=np.float64
+                                        ),
+                                        0.005,
+                                        np.array(
+                                            [rgba[0], rgba[1], rgba[2], 0.95],
+                                            dtype=np.float32,
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
+                            # Attach a label sphere with the pose_id just above the
+                            # EE position so the number follows the projected pose.
+                            if show_labels and viewer.user_scn.ngeom < int(
+                                viewer.user_scn.maxgeom
+                            ):
+                                try:
+                                    label_pos = np.asarray(
+                                        sp.ee_position, dtype=np.float64
+                                    ) + np.array([0.0, 0.0, 0.03])
+                                    gi = int(viewer.user_scn.ngeom)
+                                    g = viewer.user_scn.geoms[gi]
+                                    mujoco.mjv_initGeom(
+                                        g,
+                                        int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                                        np.array(
+                                            [0.006, 0.006, 0.006], dtype=np.float64
+                                        ),
+                                        label_pos,
+                                        np.eye(3, dtype=np.float64).reshape(9),
+                                        rgba_hand,
+                                    )
+                                    try:
+                                        g.label = f"{int(pid)}"
+                                    except Exception:
+                                        try:
+                                            g.label = f"{int(pid)}".encode("ascii")
+                                        except Exception:
+                                            pass
+                                    viewer.user_scn.ngeom = gi + 1
+                                except Exception:
+                                    pass
+                    try:
+                        viz_mj._add_scene_sphere(
+                            viewer.user_scn,
+                            np.asarray(panel_cur.center_world, dtype=np.float64),
+                            0.01,
+                            np.array([0.0, 1.0, 0.0, 0.8], dtype=np.float32),
+                        )
+                    except Exception:
+                        pass
+
+                viewer.sync()
+
+                if elapsed >= frame_duration:
+                    started_at = time.time()
+                    frame_idx = (frame_idx + 1) % n_frames_total
+                    drawer_q_from = float(ts_poses[frame_idx][0])
+                    drawer_q_to = float(ts_poses[(frame_idx + 1) % n_frames_total][0])
+                    panel_ref_tuple = (
+                        ts_poses[frame_idx][1].center_world.copy(),
+                        ts_poses[frame_idx][1].rotation_world.copy(),
+                    )
+                    frame_id_poses = list(ts_poses[frame_idx][2])
+                    surviving_ids = [int(pid) for pid, _ in frame_id_poses]
+                    if frame_idx % 10 == 0:
+                        print(
+                            f"[ts-viz] frame {frame_idx}/{n_frames_total} "
+                            f"drawer_q={drawer_q_from:.4f} "
+                            f"live_ids={surviving_ids[:15]}"
+                            f"{'...' if len(surviving_ids) > 15 else ''} "
+                            f"({len(surviving_ids)}/{n_ref_poses})",
+                            flush=True,
+                        )
+
+                time.sleep(render_interval)
+
+    except KeyboardInterrupt:
+        print("[ts-viz] stopped by user.", flush=True)
+    except Exception as exc:
+        print(f"[ts-viz] stopped: {exc}", flush=True)
+    finally:
+        env.sim.data.qpos[:] = qpos_saved
+        env.sim.data.qvel[:] = qvel_saved
+        env.sim.forward()
+
+
+def run_timeseries_pipeline(args):
+    """Entry point for ``--ts-skeleton``."""
+    print("[ts-pipeline] ====== time-series skeleton pipeline ======", flush=True)
+    ts_poses, env = solve_timeseries_skeleton_poses(args)
+    if not ts_poses:
+        print("[ts-pipeline] no poses produced. Exiting.", flush=True)
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
+        return
+    if env is None:
+        env = create_close_drawer_env(args)
+    frame_name = str(
+        getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+    ).split(":")[0]
+    import robocasa.demos.ee_skelton as _skel
+
+    skeleton = _skel.build_panda_skeleton(env, frame_name)
+    try:
+        visualize_timeseries_skeleton_poses(ts_poses, env, skeleton, args)
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

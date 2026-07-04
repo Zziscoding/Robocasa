@@ -222,7 +222,8 @@ def solve_grasping_contact_pairs(
     obj_pos: np.ndarray,
     obj_quat: np.ndarray,
     obj_scale: np.ndarray = np.ones(3),
-    num_pairs: int = 50,
+    num_pairs: int = 512,
+    min_pairs: int = 256,
     mu_arm_obj: float = 0.9,
     friction_cone_edges: int = 8,
     min_pair_distance: float = 0.015,
@@ -246,6 +247,7 @@ def solve_grasping_contact_pairs(
     top_candidate_count: Optional[int] = None,
     seed: int = 0,
     verbose: bool = False,
+    debug: bool = False,
     # --- Handle concavity fix: COACD decomposition ---------------------------
     use_coacd: bool = False,
     coacd_threshold: float = 0.05,
@@ -257,9 +259,13 @@ def solve_grasping_contact_pairs(
     coacd_preprocess_mode: str = "auto",
     coacd_preprocess_resolution: int = 30,
     coacd_max_ch_vertex: int = 256,
-    # --- DAQP force-closure verification ------------------------------------
-    disturbance_wrench_count: int = 200,
-    force_closure_verify: bool = True,
+    # --- DEPRECATED: DAQP force-closure verification -------------------------
+    # These args are kept for backward-compatible callers but the QP-based
+    # verification has been replaced by a closed-form directional-force test
+    # (each contact's force points along the pair-connecting line; the pair
+    # passes iff both forces lie inside their Coulomb friction cones).
+    disturbance_wrench_count: int = 0,
+    force_closure_verify: bool = False,
     force_closure_verify_threshold: float = 2.0,
 ) -> list[dict]:
     """Select the top-N feasible contact pairs on a mesh, ranked by force-closure cost.
@@ -359,9 +365,18 @@ def solve_grasping_contact_pairs(
         LambdaContactControlOptimizer,
     )
 
+    del top_candidate_count, top_region_pairs, preselect_region_pairs
+    del region_anchor_count, region_radius, overlap_penalty_weight
+    del antipodal_penalty_weight, centerline_penalty_weight
+    del support_axis_penalty_weight, curvature_penalty_weight
+    del normal_consistency_min, accessibility_alignment_min
+    del support_surface_normal, support_surface_point, support_surface_clearance
+    del disturbance_wrench_count, force_closure_verify
+    del force_closure_verify_threshold, obj_mass
+
     t0 = time.perf_counter()
 
-    # --- 2. Handle concavity fix: optionally decompose the mesh with COACD ---
+    # --- 1. Optional COACD decomposition of the input mesh -------------------
     actual_mesh_path = str(mesh_path)
     coacd_mesh_path = None
     if use_coacd:
@@ -384,129 +399,151 @@ def solve_grasping_contact_pairs(
             seed=int(seed),
         )
         actual_mesh_path = coacd_mesh_path
-        if verbose:
-            print(
-                f"[miqp_grasping] COACD mesh written to {coacd_mesh_path}",
-                flush=True,
-            )
 
+    # --- 2. Build the optimizer purely to reuse its surface sampling  --------
+    # (sample_point / normal / t1 / t2). The 6-D QP force-closure ranking is
+    # bypassed entirely — see step 3 below.
     optimizer = LambdaContactControlOptimizer(
         mesh_path=actual_mesh_path,
-        obj_mass=float(obj_mass),
+        obj_mass=1e-3,
         arm_friction=float(mu_arm_obj),
         sample_num=int(sample_budget),
         scale_factors=tuple(float(s) for s in np.asarray(obj_scale).reshape(3)),
         num_grasp_contacts=2,
         friction_cone_edges=int(friction_cone_edges),
         min_pair_distance=float(min_pair_distance),
-        region_anchor_count=int(region_anchor_count),
-        region_radius=float(region_radius),
-        top_region_pairs=int(top_region_pairs),
-        preselect_region_pairs=int(preselect_region_pairs),
-        overlap_penalty_weight=float(overlap_penalty_weight),
-        antipodal_penalty_weight=float(antipodal_penalty_weight),
-        centerline_penalty_weight=float(centerline_penalty_weight),
-        support_axis_penalty_weight=float(support_axis_penalty_weight),
-        curvature_penalty_weight=float(curvature_penalty_weight),
-        normal_consistency_min=float(normal_consistency_min),
-        accessibility_alignment_min=float(accessibility_alignment_min),
         nlp_solver=str(nlp_solver),
         static_nlp_solver=str(nlp_solver),
     )
 
-    if support_surface_normal is not None:
-        optimizer.set_support_surface(
-            support_surface_point=support_surface_point,
-            support_surface_normal=_normalize(support_surface_normal),
-            support_surface_clearance=float(support_surface_clearance),
-        )
+    sample_point = np.asarray(optimizer.sample_point, dtype=np.float64)
+    normal = np.asarray(optimizer.normal, dtype=np.float64)
+    t1_arr = np.asarray(optimizer.t1, dtype=np.float64)
+    t2_arr = np.asarray(optimizer.t2, dtype=np.float64)
+    n_samples = int(sample_point.shape[0])
+
+    if n_samples < 2:
+        if coacd_mesh_path is not None and coacd_mesh_path != str(mesh_path):
+            import os as _os
+
+            try:
+                _os.unlink(coacd_mesh_path)
+            except OSError:
+                pass
+        return []
 
     obj_pos = np.asarray(obj_pos, dtype=np.float64).reshape(3)
     obj_rot = _quat_wxyz_to_matrix(obj_quat)
 
-    if top_candidate_count is None:
-        top_candidate_count = num_pairs
+    # --- 3. Closed-form directional-force friction-cone test -----------------
+    # For every unordered pair (i, j), fix the contact forces to point along
+    # the line connecting the two contacts:
+    #     f_i = normalize(p_j - p_i),   f_j = -f_i
+    # Translation and torque balance are automatic (two colinear opposing
+    # forces). The pair is force-closable iff each fixed force lies inside
+    # its Coulomb friction cone at that contact:
+    #     dot(f_i, n_i) > 0 AND ||f_i_lateral|| <= mu * dot(f_i, n_i)
+    # where n_i is the inward surface normal.  Ranking is by cone margin
+    # (larger = more centered in the friction cone).
+    mu = max(float(mu_arm_obj), 1e-6)
+    min_dist = max(float(min_pair_distance), 0.0)
+    # Broadcast pairwise vectors.
+    idx_i, idx_j = np.triu_indices(n_samples, k=1)
+    p_i = sample_point[idx_i]
+    p_j = sample_point[idx_j]
+    n_i = normal[idx_i]
+    n_j = normal[idx_j]
 
-    cache = optimizer.precompute_contact_search_cache(
-        object_pos=obj_pos,
-        object_rot=obj_rot,
-        top_candidate_count=int(top_candidate_count),
-        gravity_world=(0.0, 0.0, -9.81),
-    )
+    diff = p_j - p_i
+    dist = np.linalg.norm(diff, axis=1)
+    # Force direction on contact i: from i toward j (both are unit-normalized).
+    with np.errstate(invalid="ignore", divide="ignore"):
+        f_i_dir = diff / np.where(dist[:, None] > 1e-12, dist[:, None], 1.0)
+    # Contact i: force is +f_i_dir; contact j: force is -f_i_dir.
+    # Cone check uses the *inward* surface normal (points into the object),
+    # which is what optimizer.normal already stores.
+    cos_i = np.einsum("ij,ij->i", f_i_dir, n_i)
+    cos_j = np.einsum("ij,ij->i", -f_i_dir, n_j)
+    # Cone margin: cos(angle) between force and inward normal must exceed
+    # the friction-cone half-aperture cos(atan(mu)) = 1/sqrt(1+mu²).
+    cone_threshold = 1.0 / float(np.sqrt(1.0 + mu * mu))
 
-    candidate_entries = cache.get("candidate_entries", [])
-    if not candidate_entries:
-        if verbose:
-            print("[miqp_grasping] no feasible contact pairs found.", flush=True)
-        return []
+    cone_i_ok = cos_i >= cone_threshold
+    cone_j_ok = cos_j >= cone_threshold
+    dist_ok = dist >= min_dist
+    valid_mask = cone_i_ok & cone_j_ok & dist_ok
 
-    result = []
-    sample_point = np.asarray(optimizer.sample_point, dtype=np.float64)
-    normal = np.asarray(optimizer.normal, dtype=np.float64)
-    t1 = np.asarray(optimizer.t1, dtype=np.float64)
-    t2 = np.asarray(optimizer.t2, dtype=np.float64)
-
-    n_verified = 0
-    n_passed = 0
-    verify_t0 = time.perf_counter()
-
-    for entry in candidate_entries:
-        if len(result) >= num_pairs:
-            break
-
-        contact_indices = np.asarray(
-            entry.get("contact_indices", []), dtype=int
-        ).reshape(-1)
-        if contact_indices.size != 2:
-            continue
-
-        entry_valid = bool(
-            np.isfinite(entry.get("offline_force_closure_cost", float("inf")))
+    if debug or verbose:
+        total_pairs = int(idx_i.size)
+        reject_dist = int(np.sum(~dist_ok))
+        reject_cone_i = int(np.sum(dist_ok & ~cone_i_ok))
+        reject_cone_j = int(np.sum(dist_ok & cone_i_ok & ~cone_j_ok))
+        print(
+            f"[miqp_grasping] pair sweep: total={total_pairs} "
+            f"reject_too_close={reject_dist} "
+            f"reject_cone_i={reject_cone_i} "
+            f"reject_cone_j={reject_cone_j} "
+            f"valid={int(valid_mask.sum())} "
+            f"(mu={mu:.3f}, cone_threshold={cone_threshold:.4f}, "
+            f"min_dist={min_dist:.4f})",
+            flush=True,
         )
 
-        # --- 3. Optional secondary force-closure verification -----------------
-        if entry_valid and force_closure_verify and disturbance_wrench_count > 0:
-            n_verified += 1
-            verify_res = _verify_force_closure_direct(
-                optimizer,
-                contact_indices,
-                disturbance_wrench_count=int(disturbance_wrench_count),
-                threshold=float(force_closure_verify_threshold),
-                seed=int(seed)
-                + int(contact_indices[0]) * 7919
-                + int(contact_indices[1]) * 104729,
+    valid_indices = np.nonzero(valid_mask)[0]
+    if valid_indices.size == 0:
+        if verbose:
+            print(
+                "[miqp_grasping] no valid pairs after friction-cone test.",
+                flush=True,
             )
-            if not verify_res["valid"]:
-                entry_valid = False
-                if verbose:
-                    print(
-                        f"[miqp_grasping] pair {contact_indices.tolist()} failed "
-                        f".verify (max_residual={verify_res['max_residual']:.4e}, "
-                        f"mean={verify_res['mean_residual']:.4e}, "
-                        f"n_tested={verify_res['n_tested']})",
-                        flush=True,
-                    )
-            else:
-                n_passed += 1
+        if coacd_mesh_path is not None and coacd_mesh_path != str(mesh_path):
+            import os as _os
 
-        if not entry_valid:
-            continue
+            try:
+                _os.unlink(coacd_mesh_path)
+            except OSError:
+                pass
+        return []
 
-        # Object-local geometry.
-        pts_local = sample_point[contact_indices]  # (2, 3)
-        nrm_local = normal[contact_indices]  # (2, 3)
-        t1_local = t1[contact_indices]  # (2, 3)
-        t2_local = t2[contact_indices]  # (2, 3)
+    # Rank surviving pairs by the WORST of the two cone-alignment cosines
+    # (larger = both forces more centered in cone). Break ties by the sum
+    # so nearly-antipodal pairs win over slightly-off ones.
+    cone_min = np.minimum(cos_i[valid_indices], cos_j[valid_indices])
+    cone_sum = cos_i[valid_indices] + cos_j[valid_indices]
+    order = np.lexsort((-cone_sum, -cone_min))
+    ranked = valid_indices[order]
 
-        # World-frame geometry.
+    max_return = int(max(min_pairs, num_pairs))
+    ranked = ranked[:max_return]
+
+    if verbose and int(ranked.size) < int(min_pairs):
+        print(
+            f"[miqp_grasping] only {int(ranked.size)} valid pairs available "
+            f"(requested min_pairs={int(min_pairs)}).",
+            flush=True,
+        )
+
+    result: list[dict] = []
+    for pair_idx in ranked:
+        i = int(idx_i[int(pair_idx)])
+        j = int(idx_j[int(pair_idx)])
+        pts_local = np.stack([sample_point[i], sample_point[j]], axis=0)
+        nrm_local = np.stack([normal[i], normal[j]], axis=0)
+        t1_local = np.stack([t1_arr[i], t1_arr[j]], axis=0)
+        t2_local = np.stack([t2_arr[i], t2_arr[j]], axis=0)
+
         pts_world = (obj_rot @ pts_local.T).T + obj_pos[None, :]
         nrm_world = (obj_rot @ nrm_local.T).T
         t1_world = (obj_rot @ t1_local.T).T
         t2_world = (obj_rot @ t2_local.T).T
 
+        margin_i = float(cos_i[int(pair_idx)])
+        margin_j = float(cos_j[int(pair_idx)])
+        pair_margin = float(min(margin_i, margin_j))
+
         result.append(
             {
-                "contact_indices": contact_indices.copy(),
+                "contact_indices": np.array([i, j], dtype=int),
                 "contact_points_world": pts_world,
                 "contact_points_local": pts_local,
                 "normals_world": nrm_world,
@@ -515,38 +552,33 @@ def solve_grasping_contact_pairs(
                 "tangent2_world": t2_world,
                 "tangent1_local": t1_local,
                 "tangent2_local": t2_local,
-                "force_closure_cost": float(
-                    entry.get("offline_force_closure_cost", float("inf"))
-                ),
-                "total_cost": float(
-                    entry.get("offline_force_closure_total_cost", float("inf"))
-                ),
+                # Preserve legacy keys; use (1 - cone_margin) so "lower is
+                # better" matches the old force_closure_cost semantics.
+                "force_closure_cost": float(1.0 - pair_margin),
+                "total_cost": float(1.0 - pair_margin),
                 "valid": True,
-                "antipodal_margin": float(
-                    entry.get("antipodal_margin", 0.0)
-                    if "antipodal_margin" in entry
-                    else entry.get("offline_force_closure_cost", float("inf"))
-                ),
+                "antipodal_margin": pair_margin,
+                "cone_cosine_i": margin_i,
+                "cone_cosine_j": margin_j,
+                "pair_distance": float(dist[int(pair_idx)]),
             }
         )
 
-    verify_elapsed = time.perf_counter() - verify_t0
     elapsed = time.perf_counter() - t0
 
-    # Clean up the temporary COACD mesh file if one was created.
     if coacd_mesh_path is not None and coacd_mesh_path != str(mesh_path):
-        import os
+        import os as _os
 
         try:
-            os.unlink(coacd_mesh_path)
+            _os.unlink(coacd_mesh_path)
         except OSError:
             pass
 
     if verbose:
         print(
-            f"[miqp_grasping] selected {len(result)} / {num_pairs} pairs "
-            f"({n_verified} verified, {n_passed} passed) "
-            f"in {elapsed:.3f}s (verify {verify_elapsed:.3f}s)",
+            f"[miqp_grasping] selected {len(result)} / {max_return} pairs "
+            f"(min_pairs={int(min_pairs)}, n_samples={n_samples}) "
+            f"in {elapsed:.3f}s",
             flush=True,
         )
 
