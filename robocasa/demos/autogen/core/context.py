@@ -36,6 +36,15 @@ class PipelineContext:
     # List of (candidate_index, SkeletonPose) tuples, theta-diverse ordered.
     skeleton_poses: list = field(default_factory=list)
 
+    # --- open-drawer grasp state ---
+    surface: Any = None  # handle surface (vs. panel in close_demo)
+    demonstration_seed: Any = None
+    miqp_pairs: list = field(default_factory=list)
+    grasp_skeleton_poses: list = field(default_factory=list)
+    pregrasping_solution: Any = None  # PreContactMinkSolution
+    pregrasping_pair_index: int = -1
+    open_stages: list = field(default_factory=list)  # list[OpenDrawerStage]
+
     # --- step-2 solutions ---
     # Final accepted MinkContactSolution objects.
     solutions: list = field(default_factory=list)

@@ -2,14 +2,23 @@
 
 Reads a YAML config and dispatches to the right manipulation pipeline:
 
-1. Load YAML (defaults to ``open_drawer_contact_curobo.yaml``). The YAML's
-   ``task_name`` field (e.g. ``open_drawer`` / ``close_drawer``) and/or
-   ``drawer_action`` field selects scene + action.
-2. Run the world-model prehensile-need probe.
-3. If ``use_prehens == 0`` → invoke the modular close-drawer pipeline
-   (COACD → feasible candidates → DAQP skeleton poses → MPPI/mink step-2 →
-   rollout filtering → cuRobo trajectory, with 3 popup visualizations).
-   If ``use_prehens == 1`` → prehensile pipeline placeholder (TODO).
+1. Load YAML (defaults to ``open_drawer_contact_curobo.yaml``).
+   The YAML's ``task_name`` field (e.g. ``open_drawer`` / ``close_drawer``)
+   and/or ``drawer_action`` field selects the scene + action.
+2. Run the world-model prehensile-need probe (close_drawer path only — the
+   open_drawer path is always grasp; its probe is a no-op).
+3. Look up the task pipeline in ``core.pipeline.TASK_REGISTRY`` and execute
+   the corresponding stages:
+
+   * ``close_drawer`` → COACD → feasible candidates → DAQP skeleton poses →
+     MPPI/mink step-2 → rollout filtering → cuRobo trajectory, with 3 popup
+     visualizations.
+   * ``open_drawer`` → COACD → MIQP contact pairs → dual-finger DAQP
+     skeleton → pre-grasp mink/MPPI + grasp rollout filter → cuRobo
+     trajectory, with 2 popup visualizations.
+
+Adding a new task means registering a new builder in
+``core.pipeline.TASK_REGISTRY`` — no changes in this file are required.
 """
 
 from __future__ import annotations
@@ -129,38 +138,60 @@ class _ProbeDone(Exception):
     pass
 
 
-def _dispatch_nonprehensile(args: argparse.Namespace) -> None:
-    """Run the modular close-drawer pipeline."""
-    autogen_print("dispatch=nonprehensile (modular close_drawer pipeline)")
-    from .core.args import parse_autogen_args
-    from robocasa.demos.demo_close_drawer_contact_curobo import (
-        parse_args as close_parse_args,
-    )
+def _merge_overrides(
+    autogen_args: argparse.Namespace, yaml_args: argparse.Namespace
+) -> argparse.Namespace:
+    """Merge YAML-supplied keys not already set on the autogen namespace.
 
-    # Parse args with autogen-specific defaults.
-    autogen_args = parse_autogen_args(close_parse_args)
-
-    # Merge any YAML-supplied overrides.
-    for key, value in vars(args).items():
+    The autogen parser already inherits / overrides the demo-level defaults,
+    so we only need to merge the YAML config fields the caller actually
+    explicitly passed (i.e. flags not absorbed through the CLI poppy parser).
+    """
+    for key, value in vars(yaml_args).items():
         if not hasattr(autogen_args, key):
             setattr(autogen_args, key, value)
+    return autogen_args
 
+
+def _dispatch(args: argparse.Namespace, task_name: str) -> None:
+    """Run any task pipeline by name."""
+    autogen_print(f"dispatch=task task_name={task_name}")
     ctx = PipelineContext()
-    stages = get_stages("close_drawer", autogen_args)
+    stages = get_stages(task_name, args)
     started = time.perf_counter()
     try:
-        run_pipeline(ctx, autogen_args, stages)
+        run_pipeline(ctx, args, stages)
     finally:
         elapsed = time.perf_counter() - started
-        autogen_print(f"pipeline_done elapsed_s={elapsed:.3f}")
+        autogen_print(f"pipeline_done task={task_name} elapsed_s={elapsed:.3f}")
         try:
             ctx.env.close()
         except Exception:
             pass
 
 
-def _dispatch_prehensile() -> None:
-    autogen_print("dispatch=prehensile (TODO: implement)")
+def _dispatch_close_drawer(args: argparse.Namespace) -> None:
+    """Parse close-drawer args and run the push pipeline."""
+    autogen_print("dispatch=close_drawer")
+    from .core.args import parse_autogen_args
+    from robocasa.demos.demo_close_drawer_contact_curobo import (
+        parse_args as close_parse_args,
+    )
+
+    autogen_args = _merge_overrides(parse_autogen_args(close_parse_args), args)
+    _dispatch(autogen_args, "close_drawer")
+
+
+def _dispatch_open_drawer(args: argparse.Namespace) -> None:
+    """Parse open-drawer args and run the grasp pipeline."""
+    autogen_print("dispatch=open_drawer (grasp pipeline)")
+    from .core.args import parse_open_autogen_args
+    from robocasa.demos.demo_open_drawer_contact_curobo import (
+        parse_args as open_parse_args,
+    )
+
+    autogen_args = _merge_overrides(parse_open_autogen_args(open_parse_args), args)
+    _dispatch(autogen_args, "open_drawer")
 
 
 def main() -> None:
@@ -191,10 +222,14 @@ def main() -> None:
         f"ratio={probe.get('ratio', float('nan')):.3f}"
     )
 
-    if use_prehens == 0:
-        _dispatch_nonprehensile(args)
+    if task_name == "close_drawer":
+        _dispatch_close_drawer(args)
+    elif task_name == "open_drawer":
+        _dispatch_open_drawer(args)
     else:
-        _dispatch_prehensile()
+        autogen_print(
+            f"dispatch=no-op (task_name={task_name!r}, " f"use_prehens={use_prehens})"
+        )
 
 
 if __name__ == "__main__":

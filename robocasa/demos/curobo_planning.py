@@ -714,10 +714,48 @@ def plan_joint_goal(
             cached,
             name=name,
         )
-        raise RuntimeError(
-            f"cuRobo joint-space plan failed for '{name}': {result.status}\n"
-            f"{diagnostics}"
+        # Non-fatal fallback: cuRobo could not find a feasible joint-space
+        # trajopt path, but we still want SOMETHING to visualize. Emit a
+        # straight-line joint-space interpolation from start to goal and
+        # warn loudly. Set `args.curobo_joint_require_success = True` to
+        # restore the hard failure.
+        if bool(getattr(args, "curobo_joint_require_success", False)):
+            raise RuntimeError(
+                f"cuRobo joint-space plan failed for '{name}': {result.status}\n"
+                f"{diagnostics}"
+            )
+        import sys as _sys
+
+        print(
+            f"[curobo_joint] WARNING: plan failed for '{name}' "
+            f"(status={result.status}); falling back to linear joint-space "
+            f"interpolation for visualization.\n{diagnostics}",
+            file=_sys.__stdout__,
+            flush=True,
         )
+        fallback_steps = max(int(getattr(args, "curobo_joint_fallback_steps", 40)), 2)
+        alphas = np.linspace(0.0, 1.0, fallback_steps, dtype=np.float64)[:, None]
+        q_plan_robosuite = (1.0 - alphas) * q_start_robosuite.reshape(
+            1, 7
+        ) + alphas * q_goal_robosuite.reshape(1, 7)
+        return q_plan_robosuite, [
+            {
+                "name": name,
+                "steps": int(q_plan_robosuite.shape[0]),
+                "planner": "linear_joint_interpolation_fallback",
+                "curobo_joint_names": tuple(curobo_joint_names),
+                "robosuite_joint_names": tuple(robosuite_joint_names),
+                "goal_q_robosuite": q_goal_robosuite.reshape(7).tolist(),
+                "world_obstacle_count": int(len(cached["world_obstacle_names"])),
+                "world_signature": str(cached["world_signature"]),
+                "curobo_base_pos_world": list(cached["curobo_base_pos_world"]),
+                "curobo_base_quat_wxyz_world": list(
+                    cached["curobo_base_quat_wxyz_world"]
+                ),
+                "status": f"fallback_after:{result.status}",
+                "terminal_collision_allowed": True,
+            }
+        ]
     interpolated = result.get_interpolated_plan()
     if interpolated is None:
         q_plan_curobo = close_demo._tensor_to_numpy(getattr(result, "raw_plan", None))

@@ -11,7 +11,20 @@ from __future__ import annotations
 import argparse
 from typing import Any, Callable
 
-from . import candidates, planner, scene, skeleton, step2, viz
+from . import (
+    candidates,
+    grasp_contacts,
+    grasp_env,
+    grasp_miqp_skeleton,
+    grasp_planner,
+    grasp_pregrasp,
+    grasp_viz,
+    planner,
+    scene,
+    skeleton,
+    step2,
+    viz,
+)
 from .context import PipelineContext, autogen_print
 
 Stage = Callable[[PipelineContext, argparse.Namespace], PipelineContext]
@@ -30,6 +43,28 @@ def _close_drawer_pipeline(args: argparse.Namespace) -> list[Stage]:
         lambda ctx, a=args: _viz_floating_ee(ctx, a),
         planner.plan_trajectory_stage,
         lambda ctx, a=args: _viz_contact_pd(ctx, a),
+    ]
+
+
+def _open_drawer_grasp_pipeline(args: argparse.Namespace) -> list[Stage]:
+    """Build the open-drawer *grasp* pipeline.
+
+    OPENDRAWER env → handle surface → demonstration seed → COACD contacts →
+    MIQP contact pairs → dual-finger DAQP skeleton → pre-grasp mink/MPPI →
+    grasp rollout filter → cuRobo trajectory.
+    """
+    return [
+        grasp_env.build_open_drawer_env_stage,
+        grasp_env.set_panel_stage,
+        grasp_env.set_robot_state_stage,
+        grasp_env.set_surface_stage,
+        grasp_env.load_demonstration_seed_stage,
+        grasp_contacts.evaluate_open_contacts_stage,
+        grasp_viz.visualize_contact_pairs_stage,
+        grasp_miqp_skeleton.miqp_and_skeleton_stage,
+        grasp_pregrasp.solve_pregrasp_stage,
+        grasp_viz.visualize_grasp_precontact_stage,
+        grasp_planner.plan_open_drawer_trajectory_stage,
     ]
 
 
@@ -72,24 +107,10 @@ def _viz_contact_pd(ctx: PipelineContext, args: argparse.Namespace) -> PipelineC
     return ctx
 
 
-def _open_drawer_stub(
-    ctx: PipelineContext, args: argparse.Namespace
-) -> PipelineContext:
-    autogen_print("dispatch=open_drawer (TODO: implement modular pipeline)")
-    return ctx
-
-
-def _prehensile_stub(ctx: PipelineContext, args: argparse.Namespace) -> PipelineContext:
-    autogen_print("dispatch=prehensile (TODO: implement)")
-    return ctx
-
-
 # --- Task registry ----------------------------------------------------------
 TASK_REGISTRY: dict[str, Callable[[argparse.Namespace], list[Stage]]] = {
     "close_drawer": _close_drawer_pipeline,
-    "open_drawer": lambda args: [
-        lambda ctx, a=args: _open_drawer_stub(ctx, a),
-    ],
+    "open_drawer": _open_drawer_grasp_pipeline,
 }
 
 

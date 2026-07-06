@@ -956,20 +956,29 @@ def _solve_stage_autogen(env, surface, pull_distance, args, stage_name):
     # Grasp mode: disable the pull stage (we close the gripper instead).
     _pull_backup = getattr(args, "execute_pull_stage", True)
     args.execute_pull_stage = False
+    # Fingers-first: open the gripper wide BEFORE curobo/MPC pre-grasp so
+    # the collision validator does not mistake a finger-touching-handle
+    # contact for arm_target_penetration, and the planned arm trajectory
+    # sees a wide-open EE (fingers close as a separate post-trajectory step
+    # once the panda is static at the pre-grasp arm-q).
+    from robocasa.demos.franka_collision_model import open_env_gripper_wide
+
+    _autogen_saved_gripper_qpos = open_env_gripper_wide(env)
+    args._autogen_saved_gripper_qpos = _autogen_saved_gripper_qpos
     try:
         stage, reports, robot_state = _BASE_SOLVE_STAGE(
             env, surface, pull_distance, args, stage_name
         )
     finally:
         args.execute_pull_stage = _pull_backup
-    if not bool(getattr(args, "_autogen_visualized_mink_precontact_q", False)):
-        _visualize_mink_q_poses_popup(
-            env,
-            getattr(stage.mink_solution, "q_waypoints", np.zeros((0, 7))),
-            robot_state,
-            args,
-            drawer_q=float(stage.start_drawer_q),
-        )
+    # Grasp-only path: drop the contact/pull q-waypoints so downstream
+    # planners only see the single pre-grasping arm-q. cuRobo then drives the
+    # arm from its current q to that pregrasping q, and we close the gripper
+    # on arrival (no MPPI contact+pull, no drawer opening).
+    frame_name = str(
+        getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+    ).split(":", 1)[0]
+    stage = _pregrasping_collapse_stage(stage, env, frame_name)
     feasible_cache = getattr(args, "_autogen_feasible_cache", None)
     if feasible_cache is not None:
         stage.feasible_graph_edges = np.asarray(
@@ -993,6 +1002,780 @@ def _solve_stage_autogen(env, surface, pull_distance, args, stage_name):
 
 
 _solve_stage_autogen.__autogen_base__ = _BASE_SOLVE_STAGE
+
+
+def _pregrasping_collapse_stage(stage, env, frame_name):
+    """Rewrite ``stage.mink_solution`` so downstream planners only see the
+    single pre-grasping arm-q (the one returned by mink + rollout), instead of
+    the three q-waypoints (precontact / contact / pull) used to actually open
+    the drawer. Keeps curobo/replan context intact so approach-planning uses
+    the pre-grasping arm-q as the joint goal.
+
+    No-op if we cannot locate a valid precontact_solution.
+    """
+    ctx = getattr(stage, "_replan_context", None)
+    precontact_solution = None if ctx is None else ctx.get("precontact_solution", None)
+    if precontact_solution is None or not hasattr(precontact_solution, "arm_q"):
+        return stage
+    pregrasp_q = np.asarray(precontact_solution.arm_q, dtype=np.float64).reshape(7)
+    if not np.all(np.isfinite(pregrasp_q)):
+        return stage
+    saved_qpos = None
+    saved_qvel = None
+    try:
+        saved_qpos = env.sim.data.qpos.copy()
+        saved_qvel = env.sim.data.qvel.copy()
+        close_demo._set_drawer_joint_value(env, float(stage.start_drawer_q))
+        close_demo._set_env_arm_q(
+            env, tuple(ctx["robot_state"]["robocasa_joint_names"]), pregrasp_q
+        )
+        env.sim.forward()
+        site_id = env.sim.model.site_name2id(frame_name)
+        pos = (
+            np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
+            .reshape(3)
+            .copy()
+        )
+        rot = (
+            np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64)
+            .reshape(3, 3)
+            .copy()
+        )
+    finally:
+        if saved_qpos is not None:
+            env.sim.data.qpos[:] = saved_qpos
+            env.sim.data.qvel[:] = saved_qvel
+            env.sim.forward()
+
+    pregrasp_waypoints = pregrasp_q.reshape(1, 7)
+    pregrasp_pose = ("pregrasping", pos, rot)
+    stage.mink_solution.q_waypoints = pregrasp_waypoints.copy()
+    stage.mink_solution.target_gripper_poses = [pregrasp_pose]
+    stage.mink_solution.q_config_solution = (
+        None  # no q-config MPC for the grasp-only path
+    )
+    return stage
+
+
+def _plan_top5_and_show_popup(env, stages, top5, start_q, primary_segments, args):
+    """Plan a cuRobo joint-goal trajectory from ``start_q`` to each of the
+    top-5 pre-grasping q's, then play them back sequentially in a popup.
+
+    ``top5`` is a list of ``(q_arm, g_opening, score)`` tuples sorted best
+    first (as produced by ``_solve_grasp_pregrasping_mink``).  Each trajectory
+    is drawn in a distinct color and parked at its goal as a ghost so the
+    user can compare the alternative approaches.  The primary approach (best
+    score) is drawn first/opaque; the rest are translucent.
+    """
+    from robocasa.demos import demo_close_drawer_contact_curobo as close_demo
+    from robocasa.demos import dream as dream_mod
+
+    top5 = top5[:5]
+    if not top5:
+        return
+
+    arm_joint_names = None
+    stage0 = stages[0] if stages else None
+    ctx0 = getattr(stage0, "_replan_context", None) if stage0 is not None else None
+    robot_state_0 = None if ctx0 is None else ctx0.get("robot_state", None)
+    if robot_state_0 is None and stage0 is not None:
+        robot_state_0 = getattr(stage0, "_robot_state", None)
+    if robot_state_0 is None:
+        try:
+            robot_state_0 = close_demo.get_robot_arm_state(env)
+        except Exception:
+            return
+    arm_joint_names = tuple(robot_state_0["robocasa_joint_names"])
+
+    surface = None
+    if ctx0 is not None:
+        surface = ctx0.get("surface", stage0)
+    extra_exclude = (
+        dream_mod._approach_exclude_body_names(surface) if surface is not None else ()
+    )
+
+    qpos_save = env.sim.data.qpos.copy()
+    qvel_save = env.sim.data.qvel.copy()
+    frame_name = str(
+        getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+    ).split(":", 1)[0]
+    site_id = env.sim.model.site_name2id(frame_name)
+
+    drawer_q0 = float(
+        getattr(stage0, "start_drawer_q", close_demo._drawer_joint_value(env))
+        if stage0 is not None
+        else close_demo._drawer_joint_value(env)
+    )
+
+    plans: list[dict] = []
+    try:
+        for rank, (goal_q, g_open, score) in enumerate(top5):
+            goal_q = np.asarray(goal_q, dtype=np.float64).reshape(7)
+            close_demo._set_drawer_joint_value(env, drawer_q0)
+            close_demo._set_env_arm_q(env, arm_joint_names, start_q)
+            env.sim.forward()
+            cur_state = close_demo.get_robot_arm_state(env)
+            try:
+                q_approach, app_segs = dream_mod._plan_curobo_joint_goal(
+                    env,
+                    cur_state,
+                    goal_q,
+                    args,
+                    name=f"top5:{rank}:approach",
+                    extra_exclude_body_names=extra_exclude,
+                )
+            except Exception as exc:
+                _autogen_print(
+                    f"[grasp] top5 cuRobo rank={rank} score={score:+.4f} "
+                    f"failed: {exc!r}"
+                )
+                continue
+            q_approach = np.asarray(q_approach, dtype=np.float64).reshape(-1, 7)
+            if q_approach.size == 0:
+                continue
+            if not np.allclose(
+                q_approach[-1],
+                goal_q,
+                atol=float(getattr(args, "solve_stages_mink_q_atol", 1e-3)),
+                rtol=0.0,
+            ):
+                q_approach = np.concatenate([q_approach, goal_q.reshape(1, 7)], axis=0)
+            # EE pose at the goal (for ghost overlay).
+            try:
+                close_demo._set_drawer_joint_value(env, drawer_q0)
+                close_demo._set_env_arm_q(env, arm_joint_names, goal_q)
+                env.sim.forward()
+                goal_pos = np.asarray(
+                    env.sim.data.site_xpos[site_id], dtype=np.float64
+                ).copy()
+                goal_rot = (
+                    np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64)
+                    .reshape(3, 3)
+                    .copy()
+                )
+            except Exception:
+                goal_pos = None
+                goal_rot = None
+            plans.append(
+                {
+                    "rank": int(rank),
+                    "q_approach": q_approach,
+                    "goal_q": goal_q,
+                    "goal_pos": goal_pos,
+                    "goal_rot": goal_rot,
+                    "g_open": float(g_open),
+                    "score": float(score),
+                }
+            )
+    finally:
+        env.sim.data.qpos[:] = qpos_save
+        env.sim.data.qvel[:] = qvel_save
+        env.sim.forward()
+
+    if not plans:
+        _autogen_print("[grasp] top5 cuRobo: no plan produced for any candidate")
+        return
+
+    _score_strs = [f"{float(p['score']):+.3f}" for p in plans]
+    _autogen_print(
+        f"[grasp] top5 cuRobo: planned {len(plans)} approach trajectories "
+        f"(scores=[{', '.join(_score_strs)}])"
+    )
+    _visualize_top5_plans_popup(env, plans, start_q, drawer_q0, args)
+
+
+def _visualize_top5_plans_popup(env, plans, start_q, drawer_q, args):
+    """Sequential popup: play each top-5 cuRobo trajectory in order, parking
+    a ghost EE at each goal when its trajectory ends.  Blocks until the user
+    closes the viewer.  Uses a PD controller like ``_pregrasping_play_viewer``.
+    """
+    if not plans:
+        return
+    try:
+        import mujoco
+        import mujoco.viewer
+    except Exception as exc:
+        _autogen_print(f"[grasp] top5 popup import failed: {exc!r}")
+        return
+
+    from robocasa.demos import demo_close_drawer_contact_curobo as close_demo
+    from robocasa.demos import visualize_mujoco as viz_mj
+    from robocasa.demos.franka_collision_model import (
+        gripper_joint_names_for_q_mpc,
+    )
+
+    frame_name = str(
+        getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+    ).split(":", 1)[0]
+    raw_model = getattr(env.sim.model, "_model", env.sim.model)
+    raw_data = getattr(env.sim.data, "_data", env.sim.data)
+
+    try:
+        ghost_geoms = viz_mj._extract_hand_finger_ghost_geoms(env, frame_name)
+    except Exception:
+        ghost_geoms = ()
+
+    tmp_state = close_demo.get_robot_arm_state(env)
+    arm_joint_names_resolved = tuple(tmp_state["robocasa_joint_names"])
+
+    qpos_save = env.sim.data.qpos.copy()
+    qvel_save = env.sim.data.qvel.copy()
+
+    n_plans = len(plans)
+    palette = np.asarray(
+        [
+            [
+                0.05,
+                0.85,
+                0.25,
+                float(getattr(args, "autogen_mink_ghost_alpha", 0.30)),
+            ],  # green (best)
+            [0.95, 0.65, 0.05, 0.22],  # orange
+            [0.10, 0.55, 1.0, 0.22],  # blue
+            [0.85, 0.20, 0.85, 0.22],  # magenta
+            [0.10, 0.85, 0.85, 0.22],  # teal
+        ],
+        dtype=np.float32,
+    )
+
+    try:
+        site_id = env.sim.model.site_name2id(frame_name)
+        qpos_addrs = np.asarray(
+            [
+                env.sim.model.get_joint_qpos_addr(name)
+                for name in arm_joint_names_resolved
+            ],
+            dtype=np.int64,
+        )
+        dof_addrs = np.asarray(
+            [int(raw_model.joint(name).dofadr[0]) for name in arm_joint_names_resolved],
+            dtype=np.int64,
+        )
+        gripper_names = gripper_joint_names_for_q_mpc(env)
+        gripper_qpos_addrs = np.asarray(
+            [int(env.sim.model.get_joint_qpos_addr(n)) for n in gripper_names],
+            dtype=np.int64,
+        )
+
+        lookats = [
+            np.asarray(p["goal_pos"], dtype=np.float64)
+            for p in plans
+            if p.get("goal_pos") is not None
+        ]
+        if lookats:
+            lookat = np.mean(np.stack(lookats, axis=0), axis=0)
+        else:
+            lookat = np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
+
+        with mujoco.viewer.launch_passive(
+            raw_model,
+            raw_data,
+            show_left_ui=False,
+            show_right_ui=False,
+        ) as viewer:
+            try:
+                viewer.opt.geomgroup[:] = 0
+                viewer.opt.geomgroup[1] = 1
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
+            except Exception:
+                pass
+            try:
+                viewer.cam.type = 0
+                viewer.cam.fixedcamid = -1
+                viewer.cam.lookat[:] = lookat
+                viewer.cam.distance = float(
+                    getattr(args, "autogen_mink_popup_camera_distance", 0.85)
+                )
+                viewer.cam.azimuth = float(
+                    getattr(args, "autogen_mink_popup_camera_azimuth", 135.0)
+                )
+                viewer.cam.elevation = float(
+                    getattr(args, "autogen_mink_popup_camera_elevation", -25.0)
+                )
+            except Exception:
+                pass
+
+            fps = max(float(getattr(args, "autogen_mink_popup_fps", 30.0)), 1.0)
+            frame_dt = 1.0 / fps
+            sim_dt = float(getattr(raw_model, "opt", raw_model).timestep)
+            substeps = max(int(np.ceil(frame_dt / max(sim_dt, 1e-6))), 1)
+            kp = float(getattr(args, "execution_viewer_pd_kp", 350.0))
+            kd = float(getattr(args, "execution_viewer_pd_kd", 35.0))
+
+            def _arm_ids():
+                jids = np.asarray(
+                    [
+                        int(raw_model.joint(name).id)
+                        for name in arm_joint_names_resolved
+                    ],
+                    dtype=np.int64,
+                )
+                aids = []
+                for aid in range(int(raw_model.nu)):
+                    if int(raw_model.actuator_trntype[aid]) != int(
+                        mujoco.mjtTrn.mjTRN_JOINT
+                    ):
+                        continue
+                    if int(raw_model.actuator_trnid[aid, 0]) in jids:
+                        aids.append(int(aid))
+                return jids, np.asarray(aids, dtype=np.int64)
+
+            arm_joint_ids, arm_actuator_ids = _arm_ids()
+            saved_gainprm = raw_model.actuator_gainprm[arm_actuator_ids].copy()
+            saved_biasprm = raw_model.actuator_biasprm[arm_actuator_ids].copy()
+            raw_model.actuator_gainprm[arm_actuator_ids] = 0.0
+            raw_model.actuator_biasprm[arm_actuator_ids] = 0.0
+
+            def _reset_to_start(g_open):
+                env.sim.data.qpos[qpos_addrs] = start_q
+                env.sim.data.qvel[dof_addrs] = 0.0
+                if gripper_qpos_addrs.size:
+                    env.sim.data.qpos[gripper_qpos_addrs] = 0.5 * float(g_open)
+                close_demo._set_drawer_joint_value(env, float(drawer_q))
+                env.sim.forward()
+
+            try:
+                while viewer.is_running():
+                    for pi, plan in enumerate(plans):
+                        q_traj = plan["q_approach"]
+                        n_frames = int(q_traj.shape[0])
+                        goal_pos = plan.get("goal_pos")
+                        goal_rot = plan.get("goal_rot")
+                        rgba = palette[min(pi, palette.shape[0] - 1)]
+                        _reset_to_start(plan["g_open"])
+                        frame_index = 0
+                        # Play the approach trajectory.
+                        while viewer.is_running() and frame_index < n_frames:
+                            q_des = q_traj[frame_index]
+                            for _ in range(substeps):
+                                q = np.asarray(
+                                    env.sim.data.qpos[qpos_addrs], dtype=np.float64
+                                )
+                                qd = np.asarray(
+                                    env.sim.data.qvel[dof_addrs], dtype=np.float64
+                                )
+                                raw_data.qfrc_applied[:] = 0.0
+                                gravity_comp = np.asarray(
+                                    raw_data.qfrc_bias[dof_addrs], dtype=np.float64
+                                )
+                                raw_data.qfrc_applied[dof_addrs] = (
+                                    gravity_comp + kp * (q_des - q) - kd * qd
+                                )
+                                mujoco.mj_step(raw_model, raw_data)
+                            frame_index += 1
+                            if (
+                                ghost_geoms
+                                and goal_pos is not None
+                                and hasattr(viewer, "user_scn")
+                            ):
+                                viewer.user_scn.ngeom = 0
+                                for ghost in ghost_geoms:
+                                    viz_mj._add_ghost_geom(
+                                        viewer.user_scn,
+                                        ghost,
+                                        goal_pos,
+                                        goal_rot,
+                                        rgba,
+                                    )
+                            viewer.sync()
+                            time.sleep(frame_dt)
+                        # Park at the goal with the ghost visible.
+                        parked = 0
+                        park_frames = int(round(fps * 0.6))
+                        while viewer.is_running() and parked < park_frames:
+                            if (
+                                ghost_geoms
+                                and goal_pos is not None
+                                and hasattr(viewer, "user_scn")
+                            ):
+                                viewer.user_scn.ngeom = 0
+                                for ghost in ghost_geoms:
+                                    viz_mj._add_ghost_geom(
+                                        viewer.user_scn,
+                                        ghost,
+                                        goal_pos,
+                                        goal_rot,
+                                        rgba,
+                                    )
+                            viewer.sync()
+                            parked += 1
+                            time.sleep(frame_dt)
+                    if not viewer.is_running():
+                        break
+            finally:
+                raw_model.actuator_gainprm[arm_actuator_ids] = saved_gainprm
+                raw_model.actuator_biasprm[arm_actuator_ids] = saved_biasprm
+    finally:
+        env.sim.data.qpos[:] = qpos_save
+        env.sim.data.qvel[:] = qvel_save
+        env.sim.forward()
+
+
+def _pregrasping_solve_stages(env, stages, args, *, robot_state=None, frame_name=None):
+    """Grasp-only replacement for ``solve_stages``: approach each stage's
+    pre-grasping arm_q via cuRobo joint-goal planning and do NOT run the
+    MPPI contact+pull rollout. After the trajectory reaches the pregrasping
+    arm_q, ``_pregrasping_close_gripper`` closes the fingers.
+
+    The autogen main uses this (instead of ``solve_stages`` with its MPPI
+    contact+pull phase) so cuRobo only drives the arm from its current q to
+    the pre-grasping q, then we close the gripper on arrival.
+    """
+    import time as _time
+
+    started = _time.perf_counter()
+    _autogen_print("[grasp] pregrasping_solve_stages stages={}".format(len(stages)))
+    from robocasa.demos import demo_close_drawer_contact_curobo as close_demo
+
+    if not stages:
+        raise RuntimeError("pregrasping_solve_stages requires at least one stage")
+    if robot_state is None:
+        robot_state = close_demo.get_robot_arm_state(env)
+    if frame_name is None:
+        frame_name = str(
+            getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+        )
+    frame_name = str(frame_name).split(":", 1)[0]
+    arm_joint_names = tuple(robot_state["robocasa_joint_names"])
+
+    from robocasa.demos import dream as dream_mod
+
+    chunks: list[np.ndarray] = []
+    segments: list[dict] = []
+    qpos_saved = env.sim.data.qpos.copy()
+    qvel_saved = env.sim.data.qvel.copy()
+    current_q = np.asarray(robot_state["q"], dtype=np.float64).reshape(7).copy()
+    initial_q = current_q.copy()
+    current_robot_state = dict(robot_state)
+
+    try:
+        for stage_index, stage in enumerate(stages):
+            stage_start_drawer_q = float(
+                getattr(stage, "start_drawer_q", close_demo._drawer_joint_value(env))
+            )
+            ctx = getattr(stage, "_replan_context", None)
+            precontact_solution = (
+                None if ctx is None else ctx.get("precontact_solution", None)
+            )
+            if precontact_solution is not None and hasattr(
+                precontact_solution, "arm_q"
+            ):
+                approach_goal_q = np.asarray(
+                    precontact_solution.arm_q, dtype=np.float64
+                ).reshape(7)
+            else:
+                q_ws = np.asarray(
+                    stage.mink_solution.q_waypoints, dtype=np.float64
+                ).reshape(-1, 7)
+                if q_ws.size == 0:
+                    raise RuntimeError(f"Stage '{stage.name}' has no pregrasping arm_q")
+                approach_goal_q = q_ws[0]
+
+            close_demo._set_drawer_joint_value(env, stage_start_drawer_q)
+            close_demo._set_env_arm_q(env, arm_joint_names, current_q)
+            env.sim.forward()
+            current_robot_state = close_demo.get_robot_arm_state(env)
+            surface = None if ctx is None else ctx.get("surface", stage)
+
+            q_approach, approach_segments = dream_mod._plan_curobo_joint_goal(
+                env,
+                current_robot_state,
+                approach_goal_q,
+                args,
+                name=f"{stage.name}:approach",
+                extra_exclude_body_names=(
+                    dream_mod._approach_exclude_body_names(surface)
+                    if surface is not None
+                    else ()
+                ),
+            )
+            q_approach = np.asarray(q_approach, dtype=np.float64).reshape(-1, 7)
+            if q_approach.shape[0] == 0:
+                raise RuntimeError(
+                    f"cuRobo produced empty approach for stage '{stage.name}'"
+                )
+            if chunks and np.allclose(q_approach[0], chunks[-1][-1]):
+                q_approach = q_approach[1:]
+            precontact_q = approach_goal_q.reshape(1, 7)
+            if q_approach.shape[0] == 0 or not np.allclose(
+                q_approach[-1],
+                precontact_q[0],
+                atol=float(getattr(args, "solve_stages_mink_q_atol", 1e-3)),
+                rtol=0.0,
+            ):
+                q_approach = np.concatenate([q_approach, precontact_q], axis=0)
+            chunks.append(q_approach)
+            for seg in approach_segments:
+                seg = dict(seg)
+                seg["name"] = f"{stage.name}:approach"
+                seg["steps"] = int(q_approach.shape[0])
+                seg["planner"] = "curobo_joint_goal_to_mink_pregrasping"
+                seg["terminal_collision_allowed"] = False
+                segments.append(seg)
+
+            current_q = np.asarray(q_approach[-1], dtype=np.float64).reshape(7).copy()
+            close_demo._set_env_arm_q(env, arm_joint_names, current_q)
+            env.sim.forward()
+            current_robot_state = close_demo.get_robot_arm_state(env)
+    finally:
+        env.sim.data.qpos[:] = qpos_saved
+        env.sim.data.qvel[:] = qvel_saved
+        env.sim.forward()
+
+    if not chunks:
+        raise RuntimeError("pregrasping_solve_stages produced no approach trajectory")
+    q_traj = np.concatenate(chunks, axis=0)
+
+    # --- Top-5 pre-grasping q: plan a cuRobo trajectory for each and show a
+    #     sequential popup so the user can compare the alternative approaches.
+    top5 = getattr(args, "_autogen_top5_pregrasp", None) or []
+    if top5 and bool(getattr(args, "autogen_visualize_grasp_precontact", True)):
+        _plan_top5_and_show_popup(
+            env,
+            stages,
+            top5,
+            initial_q,
+            segments,
+            args,
+        )
+
+    elapsed = _time.perf_counter() - started
+    _autogen_print(
+        "curobo_time="
+        f"{float(elapsed):.6f} "
+        f"successful_segments={int(len(segments))} "
+        f"pregrasping_approach_steps={int(np.asarray(q_traj).reshape(-1, 7).shape[0])}"
+    )
+    return {
+        "q_traj": q_traj,
+        "segments": segments,
+        "stage_solutions": [],
+    }
+
+
+def _pregrasping_play_viewer(
+    env, stages, q_traj, segments, robot_state, args, *, replan_fn=None
+):
+    """Viewer that parks the arm at the pregrasping arm_q and, once the
+    trajectory finishes its last frame, closes the gripper in place so the
+    fingers tighten around the handle. The run ends when the user closes the
+    MuJoCo window.
+
+    We re-implement the PD-playback loop (rather than wrapping the base
+    viewer) solely so we can splice a "close gripper" step in after the last
+    arm frame while the MuJoCo window is still open.
+    """
+    if not bool(getattr(args, "execution_viewer", True)):
+        return
+    if q_traj is None or not np.asarray(q_traj).size:
+        print("[grasp_viewer] skipped: no arm trajectory to play", flush=True)
+        return
+    try:
+        import mujoco
+        import mujoco.viewer
+    except Exception as exc:
+        _autogen_print(f"[grasp_viewer] skipped: viewer import failed: {exc!r}")
+        return
+
+    from robocasa.demos import demo_close_drawer_contact_curobo as close_demo
+    from robocasa.demos import visualize_mujoco as viz_mj
+
+    arm_traj = np.asarray(q_traj, dtype=np.float64).reshape(-1, 7)
+    arm_joint_names = tuple(robot_state["robocasa_joint_names"])
+    raw_model = getattr(env.sim.model, "_model", env.sim.model)
+    raw_data = getattr(env.sim.data, "_data", env.sim.data)
+    qpos_saved = env.sim.data.qpos.copy()
+    qvel_saved = env.sim.data.qvel.copy()
+
+    try:
+        ghost_geoms = viz_mj._extract_hand_finger_ghost_geoms(
+            env, str(args.mink_contact_frame)
+        )
+    except Exception as exc:
+        ghost_geoms = ()
+        _autogen_print(f"[grasp_viewer] ghost overlay disabled: {exc!r}")
+
+    frame_dt = 1.0 / max(float(getattr(args, "execution_viewer_fps", 30.0)), 1.0)
+    sim_dt = float(getattr(raw_model, "opt", raw_model).timestep)
+    substeps = max(
+        int(getattr(args, "execution_viewer_pd_substeps", 0) or 0),
+        int(np.ceil(frame_dt / max(sim_dt, 1e-6))),
+        1,
+    )
+    kp = float(getattr(args, "execution_viewer_pd_kp", 350.0))
+    kd = float(getattr(args, "execution_viewer_pd_kd", 35.0))
+    qpos_addrs = np.asarray(
+        [env.sim.model.get_joint_qpos_addr(name) for name in arm_joint_names],
+        dtype=np.int64,
+    )
+    dof_addrs = np.asarray(
+        [int(raw_model.joint(name).dofadr[0]) for name in arm_joint_names],
+        dtype=np.int64,
+    )
+
+    # Gripper joints + the closed qpos we will apply after the final frame.
+    from robocasa.demos.franka_collision_model import gripper_joint_names_for_q_mpc
+
+    gripper_names = gripper_joint_names_for_q_mpc(env)
+    gripper_qpos_addrs = np.asarray(
+        [int(env.sim.model.get_joint_qpos_addr(n)) for n in gripper_names],
+        dtype=np.int64,
+    )
+    closed_opening = float(getattr(args, "grasp_closed_opening", 0.005))
+    closed_gripper_qpos = np.full(
+        len(gripper_names), 0.5 * closed_opening, dtype=np.float64
+    )
+
+    arm_joint_ids = np.asarray(
+        [int(raw_model.joint(name).id) for name in arm_joint_names],
+        dtype=np.int64,
+    )
+    arm_actuator_ids = []
+    for aid in range(int(raw_model.nu)):
+        if int(raw_model.actuator_trntype[aid]) != int(mujoco.mjtTrn.mjTRN_JOINT):
+            continue
+        if int(raw_model.actuator_trnid[aid, 0]) in arm_joint_ids:
+            arm_actuator_ids.append(int(aid))
+    arm_actuator_ids = np.asarray(arm_actuator_ids, dtype=np.int64)
+    saved_gainprm = raw_model.actuator_gainprm[arm_actuator_ids].copy()
+    saved_biasprm = raw_model.actuator_biasprm[arm_actuator_ids].copy()
+    raw_model.actuator_gainprm[arm_actuator_ids] = 0.0
+    raw_model.actuator_biasprm[arm_actuator_ids] = 0.0
+
+    # Lookat on the pre-grasping EE site so the camera frames the handle.
+    lookat = np.asarray(stages[0].selected_contact_world, dtype=float)
+    stage_start_drawer_q = float(stages[0].start_drawer_q)
+    loop = bool(getattr(args, "execution_viewer_loop", False))
+
+    def _close_gripper_in_place(env, arm_q):
+        env.sim.data.qpos[qpos_addrs] = arm_q
+        if gripper_qpos_addrs.size:
+            env.sim.data.qpos[gripper_qpos_addrs] = closed_gripper_qpos
+        env.sim.forward()
+
+    try:
+        env.sim.data.qpos[qpos_addrs] = arm_traj[0]
+        env.sim.data.qvel[dof_addrs] = 0.0
+        close_demo._set_drawer_joint_value(env, stage_start_drawer_q)
+        env.sim.forward()
+
+        with mujoco.viewer.launch_passive(raw_model, raw_data) as viewer:
+            try:
+                viewer.opt.geomgroup[:] = 0
+                viewer.opt.geomgroup[1] = 1
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTPOINT)] = 0
+                viewer.opt.flags[int(mujoco.mjtVisFlag.mjVIS_CONTACTFORCE)] = 0
+            except Exception:
+                pass
+            try:
+                viewer.cam.lookat[:] = lookat
+                viewer.cam.distance = 1.25
+                viewer.cam.azimuth = 135.0
+                viewer.cam.elevation = -25.0
+            except Exception:
+                pass
+
+            ghost_rgba = np.asarray(
+                [
+                    float(getattr(args, "execution_viewer_ghost_r", 0.05)),
+                    float(getattr(args, "execution_viewer_ghost_g", 0.45)),
+                    float(getattr(args, "execution_viewer_ghost_b", 1.0)),
+                    float(getattr(args, "execution_viewer_ghost_alpha", 0.26)),
+                ],
+                dtype=np.float32,
+            )
+            # Pre-compute the pregrasping EE pose (pos, rot) for the ghost
+            # overlay so we can render the hand at the target while the arm
+            # trajectory plays.
+            site_id_ghost = env.sim.model.site_name2id(
+                str(
+                    getattr(args, "mink_contact_frame", "gripper0_right_grip_site")
+                ).split(":", 1)[0]
+            )
+            qpos_pre_ghost = env.sim.data.qpos.copy()
+            qvel_pre_ghost = env.sim.data.qvel.copy()
+            try:
+                close_demo._set_drawer_joint_value(env, stage_start_drawer_q)
+                close_demo._set_env_arm_q(env, arm_joint_names, arm_traj[-1])
+                env.sim.forward()
+                ghost_target_pos = np.asarray(
+                    env.sim.data.site_xpos[site_id_ghost], dtype=np.float64
+                ).reshape(3)
+                ghost_target_rot = np.asarray(
+                    env.sim.data.site_xmat[site_id_ghost], dtype=np.float64
+                ).reshape(3, 3)
+            finally:
+                env.sim.data.qpos[:] = qpos_pre_ghost
+                env.sim.data.qvel[:] = qvel_pre_ghost
+                env.sim.forward()
+
+            n_frames = int(arm_traj.shape[0])
+            frame_index = 0
+            gripper_closed = False
+            while viewer.is_running():
+                if frame_index < n_frames:
+                    q_des = arm_traj[frame_index]
+                    for _ in range(substeps):
+                        q = np.asarray(env.sim.data.qpos[qpos_addrs], dtype=np.float64)
+                        qd = np.asarray(env.sim.data.qvel[dof_addrs], dtype=np.float64)
+                        raw_data.qfrc_applied[:] = 0.0
+                        gravity_comp = np.asarray(
+                            raw_data.qfrc_bias[dof_addrs], dtype=np.float64
+                        )
+                        raw_data.qfrc_applied[dof_addrs] = (
+                            gravity_comp + kp * (q_des - q) - kd * qd
+                        )
+                        mujoco.mj_step(raw_model, raw_data)
+                    frame_index += 1
+                elif not gripper_closed:
+                    # Reached the final pregrasping arm_q: close the fingers in
+                    # place so they tighten around the handle.
+                    final_q = arm_traj[-1]
+                    _close_gripper_in_place(env, final_q)
+                    gripper_closed = True
+                    site_id = env.sim.model.site_name2id(
+                        str(
+                            getattr(
+                                args, "mink_contact_frame", "gripper0_right_grip_site"
+                            )
+                        ).split(":", 1)[0]
+                    )
+                    pos = np.asarray(
+                        env.sim.data.site_xpos[site_id], dtype=np.float64
+                    ).reshape(3)
+                    _autogen_print(
+                        f"[grasp_viewer] reached pregrasping_q; closing gripper: "
+                        f"opening={closed_opening:.4f}, grip_site~{np.round(pos, 4).tolist()}"
+                    )
+                else:
+                    # Gripper closed, just keep the final pose on screen.
+                    _close_gripper_in_place(env, arm_traj[-1])
+
+                if ghost_geoms and hasattr(viewer, "user_scn"):
+                    viewer.user_scn.ngeom = 0
+                    for ghost in ghost_geoms:
+                        viz_mj._add_ghost_geom(
+                            viewer.user_scn,
+                            ghost,
+                            ghost_target_pos,
+                            ghost_target_rot,
+                            ghost_rgba,
+                        )
+                viewer.sync()
+                time.sleep(frame_dt)
+
+                if frame_index >= n_frames and not viewer.is_running():
+                    break
+            _autogen_print(
+                "[grasp_viewer] done: pregrasping arm_q reached, gripper closed"
+            )
+    finally:
+        raw_model.actuator_gainprm[arm_actuator_ids] = saved_gainprm
+        raw_model.actuator_biasprm[arm_actuator_ids] = saved_biasprm
+        env.sim.data.qpos[:] = qpos_saved
+        env.sim.data.qvel[:] = qvel_saved
+        env.sim.forward()
 
 
 def _patch_skeleton_viewers_geomgroup(ee_skelton_module):
@@ -3032,6 +3815,9 @@ def _solve_grasp_pregrasping_mink(
 
     _grasp_rollout_cache = None
     pregrasp_candidates = []  # list of (q_arm, g_opening, rollout_score, is_accepted)
+    _top5_by_score: list[
+        tuple[float, np.ndarray, float]
+    ] = []  # (score, q_arm, g_opening), desc, cap 5
     for pose_index, result in ranked:
         candidate_index, sp, _mirror_tag = skeleton_poses[int(pose_index)]
         if not bool(result.collision_free):
@@ -3129,6 +3915,10 @@ def _solve_grasp_pregrasping_mink(
         pregrasp_candidates.append(
             (q_best.copy(), float(g_best), float(rollout_score), False)
         )
+        _top5_by_score.append((float(rollout_score), q_best.copy(), float(g_best)))
+        _top5_by_score.sort(key=lambda t: t[0], reverse=True)
+        if len(_top5_by_score) > 5:
+            _top5_by_score = _top5_by_score[:5]
         if best is None or rollout_score > best[0]:
             best = (rollout_score, result, int(candidate_index))
         if rollout_score < grasp_accept_score:
@@ -3178,6 +3968,9 @@ def _solve_grasp_pregrasping_mink(
         if pregrasp_candidates:
             _last = pregrasp_candidates[-1]
             pregrasp_candidates[-1] = (_last[0], _last[1], _last[2], True)
+        args._autogen_top5_pregrasp = [
+            (q.copy(), float(g), float(s)) for s, q, g in _top5_by_score
+        ]
         try:
             _visualize_grasp_precontact_ghosts_popup(
                 env,
@@ -3197,6 +3990,9 @@ def _solve_grasp_pregrasping_mink(
         f"best_score={best[0] if best is not None else float('-inf'):+.4f} "
         f"t={time.perf_counter() - started_time:.3f}s"
     )
+    args._autogen_top5_pregrasp = [
+        (q.copy(), float(g), float(s)) for s, q, g in _top5_by_score
+    ]
     if best is not None and not bool(getattr(args, "require_mink_precontact", True)):
         rollout_score, result, candidate_index = best
         solution = mink_solver.PreContactMinkSolution(
@@ -3483,6 +4279,9 @@ def _solve_grasp_precontact_autogen(
             leave=True,
         )
     _mppi_t0 = time.perf_counter()
+    _mppi_top5: list[
+        tuple[float, np.ndarray, float]
+    ] = []  # (fc_cost, q_arm, g_opening), asc, cap 5
 
     for attempt_id, pose_index in _mppi_iter:
         candidate_index, sp, mirror_tag = skeleton_poses[int(pose_index)]
@@ -3574,8 +4373,18 @@ def _solve_grasp_precontact_autogen(
         if best is None or fc_cost < best[0]:
             best = (fc_cost, q_best, g_best, pos_err, rot_err, pen, candidate_index)
 
+        _mppi_top5.append(
+            (float(fc_cost), np.asarray(q_best, dtype=np.float64).copy(), float(g_best))
+        )
+        _mppi_top5.sort(key=lambda t: t[0])
+        if len(_mppi_top5) > 5:
+            _mppi_top5 = _mppi_top5[:5]
+
         if fc_cost < grasp_accept_threshold:
             # Build solution.
+            args._autogen_top5_pregrasp = [
+                (q.copy(), float(g), float(s)) for s, q, g in _mppi_top5
+            ]
             try:
                 env.sim.data.qpos[:] = qpos_outer_saved
                 env.sim.data.qvel[:] = qvel_outer_saved
@@ -3630,6 +4439,9 @@ def _solve_grasp_precontact_autogen(
         f"rollout_fc_cost={best[0] if best is not None else float('inf'):.6f} "
         f"t={time.perf_counter() - mink_started:.3f}s"
     )
+    args._autogen_top5_pregrasp = [
+        (q.copy(), float(g), float(s)) for s, q, g in _mppi_top5
+    ]
     if best is not None and not bool(getattr(args, "require_mink_precontact", True)):
         fc_cost, q_best, g_best, pos_err, rot_err, pen, ci = best
         try:
@@ -3980,8 +4792,21 @@ def main():
     base_globals["_stage_result"] = quiet_result
     base_globals["_count_result"] = curobo_count_result
     base_globals["_stage_banner"] = quiet_result
+    # Grasp-only path: replace MPPI-based solve_stages with a cuRobo-only
+    # approach solver that parks the arm at the pregrasping arm_q, then close
+    # the gripper on arrival (no contact+pull, no drawer opening).
     if original_solve_stages is not None:
-        base_globals["solve_stages"] = solve_stages_with_stats
+        base_globals["solve_stages"] = _pregrasping_solve_stages
+    # Match _play_open_trajectory_viewer so the post-trajectory gripper closing
+    # in _pregrasping_play_viewer runs at the end of playback. The base main
+    # calls _play_open_trajectory_viewer via the module globals.
+    base_globals["_play_open_trajectory_viewer"] = _pregrasping_play_viewer
+    # The yf_open main chooses planner via args.execution_planner ("mppi" by
+    # default in the yaml). Pin it to "curobo" so solve_stages-with-stats
+    # (used under the mppi branch) is bypassed in favor of our _pregrasping_
+    # solve_stages hooking the base main's ``solve_stages`` symbol. We also
+    # override execution_planner so that, if the base main's flow reaches the
+    # curobo path, it still goes through solve_stages-like semantics.
     with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
         _open_drawer_main()
 
