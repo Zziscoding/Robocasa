@@ -5515,7 +5515,7 @@ def parse_args():
     parser.add_argument(
         "--ts-penetration-mjwarp-batch",
         type=int,
-        default=512,
+        default=128,
         help="Worlds per mjwarp forward call (higher = more GPU memory but fewer launches).",
     )
     parser.add_argument(
