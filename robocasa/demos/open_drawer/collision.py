@@ -20,12 +20,16 @@ def robot_contact_geom_sets_for_surface(env, surface):
         if name.startswith("gripper0_right_") and "collision" in name
     }
     robot_geoms.update(ee_geoms)
-    drawer_name = surface.geom_name.split("_door")[0]
-    allowed_target_geoms = {
-        geom_id
-        for name, geom_id in model._geom_name2id.items()
-        if name.startswith(f"{drawer_name}_")
-    }
+    # Use the surface's allowed_geom_names (door + handle geoms) as the precise
+    # set of contact-target geoms. The previous broad match -- every geom whose
+    # name starts with the drawer prefix -- also swept in the counter top and
+    # the cabinet body shell that share the drawer's MuJoCo body. Those are
+    # solid obstacles, not gripping targets, so contact with them must be
+    # treated as environment penetration rather than allowed target contact.
+    allowed_target_geoms = set()
+    for name in getattr(surface, "allowed_geom_names", ()):
+        if name in model._geom_name2id:
+            allowed_target_geoms.add(int(model._geom_name2id[name]))
     return robot_geoms, ee_geoms, allowed_target_geoms
 
 
