@@ -8283,6 +8283,7 @@ def visualize_timeseries_skeleton_poses(ts_poses, env, skeleton, args):
     if not ts_poses:
         print("[ts-viz] no time-series poses to visualize.", flush=True)
         return
+    ts_poses = list(reversed(ts_poses))
 
     import contextlib
     import io
