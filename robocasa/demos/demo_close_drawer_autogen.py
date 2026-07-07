@@ -6352,9 +6352,17 @@ def _visualize_mink_q_poses_popup(
                 # Advance the frame based on wall-clock time when animating, so
                 # user sees the drawer slide + skeleton advance in (close to)
                 # real-time regardless of render FPS.
+                # Play frames in reverse (``n_frames - 1`` down to 0) so the
+                # popup visualises the drawer OPENED -> CLOSED sequence (matching
+                # the real computation: reference skel poses are computed at the
+                # OPENED state then projected along the close-drawer trajectory).
+                # Per-timestep skeleton poses (matched on drawer_q) are left
+                # unchanged — only the playback sequence is reversed.
                 if animate:
                     elapsed = time.time() - started_at
-                    frame_idx = int(elapsed / frame_seconds_effective) % n_frames
+                    frame_idx = (n_frames - 1) - (
+                        int(elapsed / frame_seconds_effective) % n_frames
+                    )
                 if not animate or frame_idx != last_frame_idx:
                     last_frame_idx = frame_idx
                     if animate:
@@ -7644,7 +7652,11 @@ def _extract_drawer_trajectory_from_demo(args):
                     source_env.sim.model.get_joint_qpos_addr(drawer_joint_name)
                 ]
             )
-            q_closed = float(jnt_range[0])  # most negative = fully closed
+            # jnt_range = [qmin, qmax]. For the drawer slide joint the
+            # convention is qmax = fully closed (0.0) and qmin = fully open
+            # (most negative).  A CloseDrawer demo must drive the drawer from
+            # its current (open) pose toward qmax = closed.
+            q_closed = float(jnt_range[1])  # qmax = fully closed
             t = np.linspace(0.0, 1.0, n_frames, dtype=np.float64)
             drawer_qs = q_current + (q_closed - q_current) * t
             cur_arm = np.asarray(
